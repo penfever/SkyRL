@@ -55,6 +55,39 @@ class Timer:
             self.update_dict[self.message] = self.update_dict.get(self.message, 0.0) + time.time() - self.start_time
 
 
+def get_system_memory_metrics() -> dict:
+    """
+    Get system RAM metrics for tracking memory usage over time.
+
+    Returns a dict with memory metrics in GB, suitable for logging to wandb/mlflow/etc.
+    Returns empty dict if psutil is not available.
+    """
+    try:
+        import psutil
+
+        # Get system-wide memory info
+        mem = psutil.virtual_memory()
+
+        # Get current process memory info
+        process = psutil.Process()
+        process_mem = process.memory_info()
+
+        return {
+            "system/ram_used_gb": mem.used / (1024 ** 3),
+            "system/ram_available_gb": mem.available / (1024 ** 3),
+            "system/ram_total_gb": mem.total / (1024 ** 3),
+            "system/ram_percent": mem.percent,
+            "system/process_rss_gb": process_mem.rss / (1024 ** 3),
+            "system/process_vms_gb": process_mem.vms / (1024 ** 3),
+        }
+    except ImportError:
+        logger.warning("psutil not installed, skipping system memory metrics")
+        return {}
+    except Exception as e:
+        logger.warning(f"Failed to get system memory metrics: {e}")
+        return {}
+
+
 def validate_batch_sizes(cfg: SkyRLTrainConfig):
     """
     Validate configured batch sizes.
@@ -654,6 +687,17 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         if value := os.environ.get(var_name):
             logger.info(f"Exporting {var_name} to ray runtime env")
             env_vars[var_name] = value
+
+    # Harbor distributed containers mode for HPC multi-node jobs
+    # This enables Harbor to spread container workload across Ray nodes
+    if os.environ.get("HARBOR_DISTRIBUTED_CONTAINERS"):
+        logger.info("Exporting HARBOR_DISTRIBUTED_CONTAINERS to ray runtime env")
+        env_vars["HARBOR_DISTRIBUTED_CONTAINERS"] = os.environ["HARBOR_DISTRIBUTED_CONTAINERS"]
+
+    # RAY_ADDRESS is needed by Harbor's distributed pool to connect to the cluster
+    if os.environ.get("RAY_ADDRESS"):
+        logger.info("Exporting RAY_ADDRESS to ray runtime env")
+        env_vars["RAY_ADDRESS"] = os.environ["RAY_ADDRESS"]
 
     if _SKYRL_USE_NEW_INFERENCE:
         env_vars["_SKYRL_USE_NEW_INFERENCE"] = "1"

@@ -17,17 +17,20 @@ import os
 import sys
 import traceback
 from dataclasses import dataclass
-from typing import Iterable, List, Set, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 from loguru import logger
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
+from skyrl.backends.skyrl_train.callbacks import TrainerState
+from skyrl.backends.skyrl_train.callbacks.builtin import DataTrackingCallback
 from skyrl.backends.skyrl_train.inference_engines.utils import (
     get_sampling_params_for_backend,
 )
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.utils.data_tracker import DataConsumptionTracker
 from skyrl.backends.skyrl_train.utils.io import io
 from skyrl.backends.skyrl_train.utils.ppo_utils import normalize_advantages_dict
 from skyrl.train.generators.base import GeneratorOutput
@@ -37,6 +40,7 @@ from skyrl.train.generators.utils import (
 )
 from skyrl.train.trainer import RayPPOTrainer
 from skyrl.train.utils import Timer
+from skyrl.train.utils.utils import get_system_memory_metrics
 from skyrl.train.utils.trainer_utils import ResumeMode, build_dataloader
 
 
@@ -160,15 +164,18 @@ class _AsyncStalenessManager:
         return min(producer_concurrency_capacity, producer_staleness_capacity)
 
     async def acquire_submission_slot(self) -> None:
-        """Block until there is capacity, then reserve a slot (increments submitted and running).
+        """Reserve a slot for generation (increments submitted and running).
 
-        This method always uses the latest current version tracked internally, which is
-        updated by `notify_capacity_change(new_global_step)`.
+        This method no longer blocks on staleness capacity. Concurrency is managed by
+        the number of workers (num_parallel_generation_workers), and stale groups are
+        discarded at consumption time in convert_generation_group_mini_batch_to_training_input().
+
+        This approach maximizes vLLM utilization by allowing all workers to submit work
+        immediately, rather than blocking when the staleness budget is exceeded.
         """
         async with self._cond:
-            while self._compute_capacity_unlocked() <= 0:
-                await self._cond.wait()
-            # Reserve slot
+            # No blocking - just increment counters
+            # Concurrency is naturally bounded by num_parallel_generation_workers
             self._stat.submitted += 1
             self._stat.running += 1
 
@@ -200,34 +207,48 @@ class _AsyncDataloader:
     """
     A train dataloader wrapper that accommodates the need of fully async training, including:
     - Thread-safe dataloader iteration with a lock, as there are multiple parallel generation workers polling data.
-    - Records consumed data UIDs for checkpointing to avoid training on the same data upon resuming.
+    - Skip-on-resume: uses DataConsumptionTracker's epoch-scoped UIDs to skip already-consumed data.
     - Set the effective dataloader length to be divisible by mini-batch size, since we cannot rely on `drop_last`
       because the batch size is 1 in fully async training.
+
+    Data consumption tracking (UID recording, epoch transitions, checkpoint persistence)
+    is handled by DataConsumptionTracker + DataTrackingCallback, not by this class.
     """
 
-    def __init__(self, train_dataloader: StatefulDataLoader, mini_batch_size: int):
+    def __init__(self, train_dataloader: StatefulDataLoader, mini_batch_size: int, data_tracker: DataConsumptionTracker):
         self._train_dataloader = train_dataloader
         self._train_dataloader_initial_state = train_dataloader.state_dict()
         self._effective_dataloader_length = len(self._train_dataloader) // mini_batch_size * mini_batch_size
         self._iter = enumerate(self._train_dataloader)
         self._lock: asyncio.Lock = asyncio.Lock()
-        self._consumed_data_uids: Set[str] = set()
-        self._exhausted: bool = False  # currently not used.
+        self._data_tracker = data_tracker
+        self._exhausted: bool = False
 
-    def load_state_from_checkpoint(self, consumed_data_uids_set: Set[str]) -> None:
+    def load_state_from_checkpoint(self) -> None:
         """
-        Load the state from a checkpoint.
-        """
-        self._consumed_data_uids = consumed_data_uids_set
+        Reset dataloader iteration state for resume.
 
+        On resume, the DataConsumptionTracker already has the consumed UIDs loaded.
+        We just need to reset the dataloader to the beginning so
+        get_next_non_consumed_data() can skip already-consumed items.
+        """
         # Reset in case the dataloader loaded the state from the checkpoint, which we do not want.
         self._train_dataloader.load_state_dict(self._train_dataloader_initial_state)
+        # Re-create the iterator so get_next_non_consumed_data() starts from
+        # the beginning of the dataset (not the exhausted iterator from __init__).
+        self._iter = enumerate(self._train_dataloader)
+        self._exhausted = False
 
     async def reset_at_epoch_end(self) -> None:
+        """Reset dataloader iterator for the next epoch.
+
+        Note: epoch-scoped UID clearing is handled by DataTrackingCallback.on_epoch_end_async,
+        which fires AFTER any checkpoint save — eliminating the race condition where UIDs
+        were cleared before the checkpoint captured them.
+        """
         async with self._lock:
             self._train_dataloader.load_state_dict(self._train_dataloader_initial_state)  # reset to initial state
             self._iter = enumerate(self._train_dataloader)
-            self._consumed_data_uids.clear()
             self._exhausted = False
 
     async def get_next_non_consumed_data(self):
@@ -237,6 +258,8 @@ class _AsyncDataloader:
         If we loaded from a checkpoint, it will skip the already-consumed data. Returns None if the dataloader is exhausted.
         """
         assert self._iter is not None and self._lock is not None, "Dataloader not initialized; call reset() first"
+        # Read the skip set from the tracker (epoch-scoped consumed UIDs)
+        skip_set = self._data_tracker.get_consumed_uids_in_epoch()
         async with self._lock:
             try:
                 while True:
@@ -245,21 +268,11 @@ class _AsyncDataloader:
                     if iter_idx >= self._effective_dataloader_length:
                         raise StopIteration
                     uid = rand_prompts[0]["uid"]
-                    if uid not in self._consumed_data_uids:
+                    if uid not in skip_set:
                         return rand_prompts
             except StopIteration:
                 self._exhausted = True
                 return None
-
-    async def mark_consumed_uids(self, uids: Iterable[str]) -> None:
-        assert self._lock is not None, "Dataloader not initialized; call reset() first"
-        async with self._lock:
-            for uid in uids:
-                assert uid not in self._consumed_data_uids, "Duplicate UID found in mini-batch"
-                self._consumed_data_uids.add(uid)
-
-    def get_consumed_uids_list(self) -> List[str]:
-        return list(self._consumed_data_uids)
 
 
 class FullyAsyncRayPPOTrainer(RayPPOTrainer):
@@ -277,14 +290,23 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         assert (
             # otherwise wasted throughput
             self.mini_batch_size <= self.num_parallel_generation_workers
-            and
-            # otherwise would never use all workers due to capacity constraint
-            self.num_parallel_generation_workers <= self.mini_batch_size * (self.max_staleness_steps + 1)
         ), (
-            "Invalid num_parallel_generation_workers, the following must hold: "
-            "mini_batch_size <= num_parallel_generation_workers <= mini_batch_size * (max_staleness_steps + 1). Got: "
-            f"{self.mini_batch_size=}, {self.num_parallel_generation_workers=}, {self.max_staleness_steps=}"
+            "Invalid num_parallel_generation_workers, must be >= mini_batch_size. Got: "
+            f"{self.mini_batch_size=}, {self.num_parallel_generation_workers=}"
         )
+        # NOTE: Upper-bound guard (workers <= mini_batch_size * (max_staleness_steps + 1))
+        # commented out to allow scaling num_parallel_generation_workers independently of
+        # max_staleness_steps. Stale groups are discarded at consumption time in
+        # convert_generation_group_mini_batch_to_training_input(), so exceeding the
+        # capacity formula is safe — it just means some groups may be discarded.
+        #
+        # assert (
+        #     self.num_parallel_generation_workers <= self.mini_batch_size * (self.max_staleness_steps + 1)
+        # ), (
+        #     "Invalid num_parallel_generation_workers, the following must hold: "
+        #     "num_parallel_generation_workers <= mini_batch_size * (max_staleness_steps + 1). Got: "
+        #     f"{self.mini_batch_size=}, {self.num_parallel_generation_workers=}, {self.max_staleness_steps=}"
+        # )
 
         # Initialize base trainer
         super().__init__(*args, **kwargs)
@@ -306,12 +328,21 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # TODO(Charlie): need to assert we are doing TIS and returning logprobs
 
         # Async-specific states
-        self.async_train_dataloader = _AsyncDataloader(self.train_dataloader, self.mini_batch_size)
+        self.data_tracker = DataConsumptionTracker(
+            mini_batch_size=self.mini_batch_size,
+            num_steps_per_epoch=self.num_steps_per_epoch,
+        )
+        self.async_train_dataloader = _AsyncDataloader(self.train_dataloader, self.mini_batch_size, self.data_tracker)
+        # Register the data tracking callback for checkpoint persistence and epoch transitions
+        self.callback_handler.add_callback(DataTrackingCallback(self.data_tracker))
         self._staleness_manager = _AsyncStalenessManager(
             max_concurrent_generation_groups=self.num_parallel_generation_workers,
             mini_batch_size=self.mini_batch_size,
             max_staleness_steps=self.max_staleness_steps,
         )
+        # Tracked at instance level so the finally block in train() can cancel
+        # them even when an exception skips the per-epoch epilogue.
+        self._active_generator_tasks: List[asyncio.Task] = []
 
     def _build_train_dataloader_and_compute_training_steps(self):
         """
@@ -320,9 +351,49 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self.train_dataloader = build_dataloader(self.cfg, self.train_dataset, is_train=True, is_fully_async=True)
         self.num_steps_per_epoch = len(self.train_dataloader) // self.mini_batch_size
         self.total_training_steps = self.num_steps_per_epoch * self.cfg.trainer.epochs
+        max_steps = getattr(self.cfg.trainer, 'max_steps', None)
+        if max_steps is not None and max_steps > 0:
+            self.total_training_steps = min(self.total_training_steps, max_steps)
         logger.info(f"Length of train_dataloader: {len(self.train_dataloader)}")
         logger.info(f"Number of steps per epoch: {self.num_steps_per_epoch}")
         logger.info(f"Total training steps: {self.total_training_steps}")
+
+    def _create_trainer_state(self, epoch: int) -> TrainerState:
+        """
+        Override to use num_steps_per_epoch for fully async training.
+
+        In fully async training, the dataloader has batch size of 1 and we
+        accumulate mini_batch_size samples before training, so the number
+        of steps per epoch is different from len(train_dataloader).
+        """
+        return TrainerState(
+            global_step=self.global_step,
+            epoch=epoch,
+            total_steps=self.total_training_steps,
+            num_steps_per_epoch=self.num_steps_per_epoch,
+            is_last_step=(self.global_step == self.total_training_steps),
+            is_epoch_end=(self.global_step % self.num_steps_per_epoch == 0) if self.num_steps_per_epoch > 0 else False,
+            metrics=dict(self.all_metrics),
+            timings=dict(self.all_timings),
+        )
+
+    def _cancel_generator_tasks(self) -> None:
+        """Cancel any active generator tasks left over from an abnormal exit.
+
+        Normally the per-epoch epilogue cancels these, but if an exception
+        breaks out of the inner training loop the epilogue is skipped.
+        """
+        tasks = self._active_generator_tasks
+        if not tasks:
+            return
+        n_running = sum(1 for t in tasks if not t.done())
+        if n_running:
+            logger.warning(
+                f"Cancelling {n_running} orphaned generator tasks from abnormal train loop exit"
+            )
+            for t in tasks:
+                t.cancel()
+        self._active_generator_tasks = []
 
     async def train(self):
         """
@@ -330,26 +401,64 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         """
         self.global_step = 0
 
-        # Load checkpoint state if resumption is enabled. Also load the data UIDs that are already trained on.
+        # Initialize generator resources (e.g., shared QueueOrchestrator for Harbor)
+        # This must happen before any generate() calls
+        try:
+            await self.generator.startup()
+            logger.info("Generator startup complete")
+        except Exception as e:
+            logger.opt(depth=0).error("Generator startup failed: " + str(e))
+            raise
+
+        try:
+            await self._train_loop()
+        except Exception as e:
+            logger.opt(exception=True).error("Train loop failed at global_step " + str(self.global_step) + ": " + str(e))
+            raise
+        finally:
+            # Cancel any orphaned generator tasks that survived an early exit
+            # (the per-epoch epilogue only runs on normal loop completion).
+            self._cancel_generator_tasks()
+
+            await self._teardown()
+
+    async def _train_loop(self):
+        """
+        Internal training loop, separated for proper generator lifecycle management.
+        """
+        # Load checkpoint state if resumption is enabled.
+        # Data consumption state is loaded via DataTrackingCallback.load_from_checkpoint()
+        # into self.data_tracker, which the async dataloader reads for skip-on-resume.
         if self.resume_mode != ResumeMode.NONE:
             with Timer("load_checkpoints"):
-                self.global_step, _, loaded_consumed_data_uids_set = self.load_checkpoints()
+                self.global_step, checkpoint_path = self.load_checkpoints()
                 logger.info(f"Resumed training from global_step {self.global_step}")
                 if self.global_step > 0:
-                    # Set async dataloader manager and staleness manager to the loaded state.
-                    self.async_train_dataloader.load_state_from_checkpoint(loaded_consumed_data_uids_set)
+                    # Load data consumption state into the tracker
+                    loaded = DataTrackingCallback.load_from_checkpoint(checkpoint_path, self.data_tracker)
+                    if not loaded:
+                        logger.warning(
+                            "No data consumption state found in checkpoint — "
+                            "resume may re-train on already-consumed data"
+                        )
+
+                    # Reset dataloader iteration for skip-on-resume
+                    self.async_train_dataloader.load_state_from_checkpoint()
                     self._staleness_manager.load_state_from_checkpoint(
                         self.global_step + 1
                     )  # +1 due to we haven't incremented yet
-                    steps_completed_in_epoch = self.global_step % self.num_steps_per_epoch
-                    if steps_completed_in_epoch == 0 and len(loaded_consumed_data_uids_set) > 0:
-                        # When resuming mid-epoch at the boundary, treat modulo 0 as a full epoch.
-                        steps_completed_in_epoch = self.num_steps_per_epoch
-                    expected_consumed_in_epoch = self.mini_batch_size * steps_completed_in_epoch
-                    assert len(loaded_consumed_data_uids_set) == expected_consumed_in_epoch, (
-                        "Unexpected number of consumed data UIDs. Got: "
-                        f"{len(loaded_consumed_data_uids_set)} != {expected_consumed_in_epoch}"
-                    )
+
+                    # Soft validation: log mismatch instead of crashing
+                    steps_into_epoch = self.global_step % self.num_steps_per_epoch
+                    if steps_into_epoch != 0:
+                        expected_consumed_in_epoch = self.mini_batch_size * steps_into_epoch
+                        actual_consumed_in_epoch = self.data_tracker.consumed_in_epoch_count
+                        if actual_consumed_in_epoch != expected_consumed_in_epoch:
+                            logger.warning(
+                                f"Data consumption count mismatch on resume: "
+                                f"expected {expected_consumed_in_epoch}, got {actual_consumed_in_epoch}. "
+                                f"This can happen after epoch boundary transitions or error recovery."
+                            )
 
         # Initialize weight sync state
         with Timer("init_weight_sync_state"):
@@ -359,11 +468,22 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         with Timer("sync_weights_to_inference_engines"):
             await self.async_sync_policy_weights_to_inference_engines()
 
-        # Eval before training
-        if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train:
+        # Create initial trainer state for on_train_begin callback
+        start_epoch = self.global_step // self.num_steps_per_epoch
+        initial_state = self._create_trainer_state(epoch=start_epoch)
+
+        # Call on_train_begin callbacks (handles eval_before_train via EvaluationCallback)
+        self._control.reset()
+        self._control = await self.callback_handler.call_event_async(
+            "on_train_begin", initial_state, self._control, trainer=self
+        )
+
+        # Handle pre-training evaluation if requested by callbacks
+        if self._control.should_evaluate and self.eval_dataset is not None:
             with Timer("eval", self.all_timings):
                 eval_metrics = await self.eval()
-                self.tracker.log(eval_metrics, step=self.global_step)
+                self.tracker.log(eval_metrics, step=self.global_step, commit=self.cfg.trainer.tracker_commit_each_step)
+            self._control.should_evaluate = False
 
         # main training loop
         pbar = tqdm(total=self.total_training_steps, initial=self.global_step, desc="Training Step Progress")
@@ -372,16 +492,22 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         for epoch in range(start_epoch, self.cfg.trainer.epochs):
             # 0. Per-epoch prologue. Note that we do not do any cross-epoch asynchrony here.
 
-            # Buffer of completed generation, size bounded by capacity - consumed = B * (max_staleness_steps + 1)
+            # Buffer of completed generation, size bounded by num_parallel_generation_workers.
             generation_output_group_buffer = asyncio.Queue[GeneratedOutputGroup](
-                maxsize=self.mini_batch_size * (self.max_staleness_steps + 1)
+                maxsize=self.num_parallel_generation_workers
             )
 
-            # Maintain self.num_parallel_generation_workers concurrent group-generation workers
-            generator_tasks = [
+            # Provide the generator with a live reference to global_step so it can
+            # capture the step at first vLLM inference (for accurate staleness tracking).
+            self.generator.global_step_fn = lambda: self.global_step
+
+            # Maintain self.num_parallel_generation_workers concurrent group-generation workers.
+            # Stored on self so the finally block in train() can cancel them on abnormal exit.
+            self._active_generator_tasks = [
                 asyncio.create_task(self._run_generate_for_a_group_loop(generation_output_group_buffer))
                 for _ in range(self.num_parallel_generation_workers)
             ]
+            generator_tasks = self._active_generator_tasks
 
             for _ in range(self.global_step, (1 + epoch) * self.num_steps_per_epoch + 1):
                 with Timer("step", self.all_timings):
@@ -407,15 +533,23 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         buffer_pbar.close()
 
                     # 2. Post-process the generated groups, aggregating to a single GeneratorOutput, and convert to training format.
-                    with Timer("convert_to_training_input", self.all_timings):
-                        training_input = await asyncio.to_thread(
-                            self.convert_generation_group_mini_batch_to_training_input, cur_generation_group_mini_batch
-                        )
+                    #    If all groups are stale, wait for more fresh data instead of crashing.
+                    training_input = None
+                    while training_input is None:
+                        with Timer("convert_to_training_input", self.all_timings):
+                            training_input = await asyncio.to_thread(
+                                self.convert_generation_group_mini_batch_to_training_input, cur_generation_group_mini_batch
+                            )
+                        if training_input is None:
+                            logger.info("Waiting for fresh generation data (refilling mini-batch)...")
+                            cur_generation_group_mini_batch = []
+                            while len(cur_generation_group_mini_batch) < self.mini_batch_size:
+                                cur_generation_group_mini_batch.append(await generation_output_group_buffer.get())
 
-                    # 3. Run training and update consumed UIDs.
+                    # 3. Run training and record consumed UIDs in the tracker.
                     with Timer("run_training", self.all_timings):
                         status = await self._run_training(training_input)
-                        await self.async_train_dataloader.mark_consumed_uids(
+                        await self.data_tracker.mark_consumed(
                             [g.uid for g in cur_generation_group_mini_batch]
                         )
 
@@ -425,47 +559,102 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         await self.async_sync_policy_weights_to_inference_engines()
                         await self.inference_engine_client.resume_generation()
 
-                # 5. Set logs for this training step.
+                # 5. Log status and update metrics
                 logger.info(status)
                 self.all_metrics.update({"trainer/epoch": epoch, "trainer/global_step": self.global_step})
-                self.tracker.log(self.all_metrics, step=self.global_step)
-                self.all_metrics = {}
-                pbar.update(1)
 
-                # 6. Eval and checkpointing if needed.
-                # NOTE(Charlie): eval does not overlap with training, but can overlap with generation. Is it fine?
-                if self.cfg.trainer.eval_interval > 0 and (
-                    self.global_step % self.cfg.trainer.eval_interval == 0
-                    or self.global_step == self.total_training_steps
-                ):
+                # 6. Create trainer state and call on_step_end callbacks
+                is_epoch_end = (_ == (1 + epoch) * self.num_steps_per_epoch)
+                is_last_step = (self.global_step == self.total_training_steps)
+                step_state = TrainerState(
+                    global_step=self.global_step,
+                    epoch=epoch,
+                    total_steps=self.total_training_steps,
+                    num_steps_per_epoch=self.num_steps_per_epoch,
+                    is_last_step=is_last_step,
+                    is_epoch_end=is_epoch_end,
+                    metrics=dict(self.all_metrics),
+                    timings=dict(self.all_timings),
+                )
+
+                self._control.reset()
+                self._control = await self.callback_handler.call_event_async(
+                    "on_step_end", step_state, self._control, trainer=self
+                )
+
+                # 7. Handle callback control signals
+
+                # Handle checkpoint saving
+                if self._control.should_save:
+                    with Timer("save_checkpoints", self.all_timings):
+                        await asyncio.to_thread(self.save_checkpoints)
+                    await self.callback_handler.call_event_async(
+                        "on_save", step_state, self._control, trainer=self
+                    )
+                    self._control.should_save = False
+
+                # Handle HF model saving
+                if self._control.should_save_hf_model:
+                    with Timer("save_hf_model", self.all_timings):
+                        await asyncio.to_thread(self.save_models)
+                    self._control.should_save_hf_model = False
+
+                # Handle evaluation
+                if self._control.should_evaluate and self.eval_dataset is not None:
                     with Timer("eval", self.all_timings):
                         eval_metrics = await self.eval()
                         self.all_metrics.update(eval_metrics)
-                if self.cfg.trainer.ckpt_interval > 0 and self.global_step % self.cfg.trainer.ckpt_interval == 0:
-                    with Timer("save_checkpoints", self.all_timings):
-                        await asyncio.to_thread(self.save_checkpoints)
-                if self.cfg.trainer.hf_save_interval > 0 and self.global_step % self.cfg.trainer.hf_save_interval == 0:
-                    with Timer("save_hf_model", self.all_timings):
-                        await asyncio.to_thread(self.save_models)
-                self.tracker.log({"timing/" + k: v for k, v in self.all_timings.items()}, step=self.global_step)
+                    await self.callback_handler.call_event_async(
+                        "on_evaluate", step_state, self._control, metrics=eval_metrics, trainer=self
+                    )
+                    self._control.should_evaluate = False
+
+                # 8. Log metrics
+                if self._control.should_log:
+                    log_payload = {
+                        **self.all_metrics,
+                        **{f"timing/{k}": v for k, v in self.all_timings.items()},
+                        **get_system_memory_metrics(),
+                    }
+                    self.tracker.log(log_payload, step=self.global_step, commit=self.cfg.trainer.tracker_commit_each_step)
+                    await self.callback_handler.call_event_async(
+                        "on_log", step_state, self._control, logs=log_payload, trainer=self
+                    )
+
+                self.all_metrics = {}
                 self.all_timings = {}
+                pbar.update(1)
+
                 self.global_step += 1
 
-                # 7. Notify generation workers that the capacity has increased, unblocking them.
+                # 9. Notify generation workers that the capacity has increased, unblocking them.
                 await self._staleness_manager.notify_capacity_change(self.global_step)
-                steps_completed_in_epoch = (self.global_step - 1) % self.num_steps_per_epoch
-                if steps_completed_in_epoch == 0:
-                    # At the end of an epoch, modulo becomes 0 but we've consumed a full epoch.
-                    steps_completed_in_epoch = self.num_steps_per_epoch
-                expected_consumed_in_epoch = self.mini_batch_size * steps_completed_in_epoch
-                actual_consumed_in_epoch = len(self.async_train_dataloader.get_consumed_uids_list())
-                assert actual_consumed_in_epoch == expected_consumed_in_epoch, (
-                    "Unexpected number of consumed data UIDs. Got: "
-                    f"{actual_consumed_in_epoch} != {expected_consumed_in_epoch}"
-                )
 
-            # 8. Per-epoch epilogue.
-            if self.cfg.trainer.update_ref_every_epoch and self.ref_model is not None:
+                # 10. Check for max_steps
+                if self.global_step > self.total_training_steps:
+                    logger.info(f"Reached max training steps ({self.total_training_steps})")
+                    break
+
+                # 11. Check for early stopping
+                if self._control.should_training_stop:
+                    logger.info("Training stopped early by callback")
+                    break
+
+            # 12. Per-epoch epilogue.
+            # Call on_epoch_end callbacks
+            epoch_state = self._create_trainer_state(epoch=epoch)
+            self._control.reset()
+            self._control = await self.callback_handler.call_event_async(
+                "on_epoch_end", epoch_state, self._control, trainer=self
+            )
+
+            # Handle ref model update at epoch end (via RefModelUpdateCallback or direct config)
+            ref_callback = self._get_ref_update_callback()
+            if (
+                self.ref_model is not None
+                and ref_callback is not None
+                and ref_callback.should_update_ref
+            ):
                 with Timer("update_ref_with_policy", self.all_timings):
                     await asyncio.to_thread(self.update_ref_with_policy)
 
@@ -476,24 +665,66 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 await asyncio.gather(*generator_tasks, return_exceptions=True)
             except Exception:
                 pass
+            self._active_generator_tasks = []
 
             # Per-epoch reset/validation for data loading and staleness management
             assert all(
                 t.done() for t in generator_tasks
             ), "Generator tasks must be done before resetting the dataloader manager and validating the staleness manager."
-            assert (
-                generation_output_group_buffer.qsize() == 0
-            ), f"We expect all generation output to be consumed by the training worker at end of an epoch, got {generation_output_group_buffer.qsize()}."
+            # Drain any generation outputs that arrived after the training loop
+            # stopped consuming (race between producer enqueue and consumer exit).
+            n_drained = 0
+            while not generation_output_group_buffer.empty():
+                try:
+                    generation_output_group_buffer.get_nowait()
+                    n_drained += 1
+                except asyncio.QueueEmpty:
+                    break
+            if n_drained > 0:
+                logger.warning(
+                    f"Drained {n_drained} unconsumed generation output(s) at epoch boundary "
+                    f"(global_step={self.global_step}). These were generated with stale weights "
+                    f"and arrived after the training loop stopped consuming."
+                )
+                # Reconcile staleness counters for drained items.  Items in the
+                # buffer may have been fully accepted (on_rollout_accepted ran)
+                # or orphaned (put_nowait succeeded but on_rollout_accepted was
+                # interrupted by CancelledError — those are already handled by
+                # the CancelledError fix above).  Only undo accepted/submitted
+                # for properly-accepted items that were never consumed.
+                consumed = (self.global_step - 1) * self.mini_batch_size
+                n_accepted_surplus = self._staleness_manager._stat.accepted - consumed
+                if n_accepted_surplus > 0:
+                    self._staleness_manager._stat.accepted -= n_accepted_surplus
+                    self._staleness_manager._stat.submitted -= n_accepted_surplus
             await self.async_train_dataloader.reset_at_epoch_end()
             await self._staleness_manager.validate_state_at_epoch_end(self.global_step)
 
+            if self.global_step > self.total_training_steps:
+                break
+
+            if self._control.should_training_stop:
+                logger.info("Training stopped early by callback at epoch end")
+                break
+
             # End of an epoch.
+
+        # End of training
         pbar.close()
-        if self.cfg.trainer.ckpt_interval > 0:
+
+        # Call on_train_end callbacks
+        final_state = self._create_trainer_state(epoch=self.cfg.trainer.epochs - 1)
+        self._control.reset()
+        self._control = await self.callback_handler.call_event_async(
+            "on_train_end", final_state, self._control, trainer=self
+        )
+
+        # Handle final checkpoint/model save if requested by callbacks
+        if self._control.should_save:
             with Timer("save_checkpoints", self.all_timings):
                 await asyncio.to_thread(self.save_checkpoints)
                 logger.info("Saved final checkpoint.")
-        if self.cfg.trainer.hf_save_interval > 0:
+        if self._control.should_save_hf_model:
             with Timer("save_hf_model", self.all_timings):
                 await asyncio.to_thread(self.save_models)
                 logger.info("Saved final model.")
@@ -560,12 +791,15 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 assert all(uid == uids[0] for uid in uids), "Expect all uids to be the same"
 
                 # 2. Acquire capacity slot.
+                # Capture global_step pessimistically at submission time (before
+                # generation starts) so the staleness value for the whole group
+                # reflects the earliest possible step, not a later one.
                 slot_acquired = False
+                global_step_at_start = self.global_step  # pessimistic: capture BEFORE slot acquisition
                 await self._staleness_manager.acquire_submission_slot()
                 slot_acquired = True
 
                 # 3. Generate one rollout group
-                global_step_at_start = self.global_step  # for staleness control
 
                 if "disable_tqdm" in inspect.signature(self.generator.generate).parameters:
                     # A workaround to disable tqdm for the SkyRLGymGenerator.generate method which will
@@ -577,29 +811,38 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     cur_generator_output: GeneratorOutput = await self.generator.generate(generator_input)
 
                 # 4. Enqueue the completed group and mark accepted to free capacity slot.
+                # Prefer the actual global_step captured at first vLLM inference (more accurate
+                # staleness) over the pessimistic capture at task pickup time.
+                actual_step = cur_generator_output.get("actual_global_step")
+                staleness_step = actual_step if actual_step is not None else global_step_at_start
                 try:
                     generation_output_group_buffer.put_nowait(
                         GeneratedOutputGroup(
                             generator_output=cur_generator_output,
                             uid=uids[0],
-                            global_step_when_scheduled=global_step_at_start,
+                            global_step_when_scheduled=staleness_step,
                         )
                     )
                 except asyncio.QueueFull:
                     raise AssertionError("Generation buffer should never be full given staleness control.")
                 await self._staleness_manager.on_rollout_accepted()
+                slot_acquired = False  # Slot properly released; safe for next iteration
         except asyncio.CancelledError:
-            # If a slot was acquired but we exit early, release running count
-            try:
-                if "slot_acquired" in locals() and slot_acquired:
-                    raise RuntimeError("Generation workers should only be cancelled when they finish running.")
-            finally:
-                return
-        except Exception as e:
-            logger.error(f"Generator worker errored out with exception: {e}")
-            logger.error(f"Traceback: \n{traceback.format_exc()}")
+            # If a slot was acquired but generation was cancelled before
+            # on_rollout_accepted() ran, undo the slot acquisition so that
+            # validate_state_at_epoch_end() sees running == 0 and
+            # submitted == accepted.  We adjust the counters synchronously
+            # because we cannot reliably `await` inside a CancelledError
+            # handler (the next await would re-raise CancelledError).
             if "slot_acquired" in locals() and slot_acquired:
-                raise RuntimeError("Generation workers should only run into error when they finish running.")
+                self._staleness_manager._stat.submitted -= 1
+                self._staleness_manager._stat.running -= 1
+            return
+        except Exception as e:
+            logger.opt(exception=True).error("Generator worker errored out with exception: " + str(e))
+            if "slot_acquired" in locals() and slot_acquired:
+                self._staleness_manager._stat.submitted -= 1
+                self._staleness_manager._stat.running -= 1
             sys.exit(1)
 
     async def async_sync_policy_weights_to_inference_engines(self):
@@ -612,43 +855,75 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
     def convert_generation_group_mini_batch_to_training_input(
         self, cur_generation_group_mini_batch: List[GeneratedOutputGroup]
-    ) -> TrainingInputBatch:
-        """Given a mini-batch of generated groups, concatenate them into a single GeneratorOutput, then convert to a TrainingInputBatch."""
+    ) -> Optional[TrainingInputBatch]:
+        """Given a mini-batch of generated groups, concatenate them into a single GeneratorOutput, then convert to a TrainingInputBatch.
+
+        Stale groups (staleness > max_staleness_steps) are discarded rather than trained on.
+        This is the deadline-based staleness control approach: instead of blocking workers
+        at submission time, we allow all workers to submit freely and discard stale results
+        at consumption time. This maximizes vLLM utilization.
+
+        Returns None if all groups in the mini-batch were stale, signaling the caller to
+        wait for fresh data rather than crash.
+        """
         generator_outputs = []
         uids = []
         stalenesses = []
-        staleness_violation_count = 0
+        discarded_count = 0
+        discarded_uids = []
         group_size = len(cur_generation_group_mini_batch[0].generator_output["response_ids"])
+
         for cur_generated_output_group in cur_generation_group_mini_batch:
             cur_staleness = self.global_step - cur_generated_output_group.global_step_when_scheduled
+
+            # Discard stale groups instead of training on them
+            if cur_staleness > self.max_staleness_steps:
+                logger.info(
+                    f"Discarding stale group uid={cur_generated_output_group.uid} "
+                    f"staleness={cur_staleness} > max={self.max_staleness_steps}"
+                )
+                discarded_count += 1
+                discarded_uids.append(cur_generated_output_group.uid)
+                continue  # Skip this group
+
             stalenesses.append(cur_staleness)
             generator_outputs.append(cur_generated_output_group.generator_output)
             uids.extend([cur_generated_output_group.uid] * group_size)
 
-            # Check staleness violation.
-            if cur_staleness > self.max_staleness_steps:
-                # TODO(Charlie): should we drop, drop and resample, or just log?
-                logger.warning(
-                    "Staleness control violated despite using AsyncStalenessManager: "
-                    f"cur_staleness={cur_staleness}, max_staleness_steps={self.max_staleness_steps}.\n"
-                    "If this happens too often, consider increasing max_staleness_steps, adjusting "
-                    "trainer.fully_async.num_parallel_generation_workers, or adjusting generation-training GPU allocation.\n"
-                    "See https://docs.skyrl.ai/docs/tutorials/fully_async#async-staleness-manager for more details."
-                )
-                staleness_violation_count += 1
+        # Handle edge case: all groups were discarded — signal caller to wait and retry
+        if len(generator_outputs) == 0:
+            logger.warning(
+                f"All {len(cur_generation_group_mini_batch)} groups in mini-batch were stale and discarded "
+                f"(max_staleness_steps={self.max_staleness_steps}). "
+                f"Training will wait for fresh generation data."
+            )
+            return None
+
+        # Log discard and effective batch statistics (always, not just when discarding)
+        total_groups = len(cur_generation_group_mini_batch)
+        kept_groups = len(generator_outputs)
+        discard_rate = discarded_count / total_groups if total_groups > 0 else 0.0
+        logger.info(
+            f"Step {self.global_step}: effective_batch={kept_groups * group_size} samples "
+            f"({kept_groups}/{total_groups} groups), discard_rate={discard_rate:.1%}"
+        )
 
         generator_output = concatenate_generator_outputs(generator_outputs)
         assert generator_output["rollout_metrics"] is not None, "Rollout metrics should be non-null."
         self.all_metrics.update(generator_output["rollout_metrics"])
 
         # Log staleness statistics for this step
+        total_groups = len(cur_generation_group_mini_batch)
         self.all_metrics.update(
             {
                 "async/staleness_mean": sum(stalenesses) / len(stalenesses),
                 "async/staleness_max": max(stalenesses),
                 "async/staleness_min": min(stalenesses),
                 "async/staleness_ratio": sum(1 for s in stalenesses if s > 0) / len(stalenesses),
-                "async/staleness_violation_count": staleness_violation_count,
+                "async/discarded_count": discarded_count,
+                "async/discard_rate": discarded_count / total_groups if total_groups > 0 else 0.0,
+                "async/effective_batch_groups": len(generator_outputs),
+                "async/effective_batch_samples": len(generator_outputs) * group_size,
             }
         )
 
@@ -657,45 +932,27 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         # print example just for debugging
         vis = self.tokenizer.decode(generator_output["response_ids"][0])
-        logger.info(f"Example generated: {vis}")
+        logger.debug(f"Example generated: {vis}")
 
         return self.convert_to_training_input(generator_output, uids)
 
     def save_checkpoints(self):
         """
-        Extend base checkpointing by recording consumed UIDs for fully-async training.
-
-        Otherwise, when resuming, there is no way to know which data has been trained on.
+        Save checkpoints. Data consumption state is persisted by DataTrackingCallback.on_save,
+        which fires after the base checkpoint save completes.
         """
-        consumed_uids_list = (
-            self.async_train_dataloader.get_consumed_uids_list()
-        )  # read first to prevent race condition
-        # The base method will save the model, dataloader path, trainer_state, and latest_ckpt_global_step.txt.
+        # The base method saves model, dataloader state, trainer_state, and latest_ckpt_global_step.txt.
+        # DataTrackingCallback.on_save (registered in __init__) writes data_consumption_state.pt.
         super().save_checkpoints()
-        # In addition, we need to save the consumed UIDs -- the data that we have already trained on.
-        global_step_folder = os.path.join(self.cfg.trainer.ckpt_path, f"global_step_{self.global_step}")
-        fully_async_state_path = os.path.join(global_step_folder, "fully_async_state.pt")
-        fully_async_state = {
-            "consumed_uids": consumed_uids_list,
-        }
-        with io.open_file(fully_async_state_path, "wb") as f:
-            torch.save(fully_async_state, f)
-        logger.info(f"Saved fully-async state to {fully_async_state_path}")
 
-    def load_checkpoints(self) -> Tuple[int, str, Set[str]]:
+    def load_checkpoints(self) -> Tuple[int, str]:
         """
-        Load the base checkpoint without loading the dataloader state, and load the fully-async state.
+        Load the base checkpoint.
 
-        Returns the global step to resume from, the checkpoint path, and the consumed data UIDs.
+        Data consumption state loading is handled separately via
+        DataTrackingCallback.load_from_checkpoint() in _train_loop().
+
+        Returns the global step to resume from and the checkpoint path.
         """
         global_step, checkpoint_path = super().load_checkpoints()
-        if global_step == 0:
-            return 0, checkpoint_path, None
-        fully_async_state_path = os.path.join(checkpoint_path, "fully_async_state.pt")
-        assert io.exists(fully_async_state_path), f"Fully-async state file not found at {fully_async_state_path}"
-        with io.open_file(fully_async_state_path, "rb") as f:
-            fully_async_state = torch.load(f, map_location="cpu", weights_only=False)
-            assert "consumed_uids" in fully_async_state, "consumed_uids key not found in fully-async state"
-            consumed_data_uids_set = set(fully_async_state["consumed_uids"])
-        logger.info(f"Loaded fully-async state with {len(consumed_data_uids_set)} consumed UIDs")
-        return global_step, checkpoint_path, consumed_data_uids_set
+        return global_step, checkpoint_path

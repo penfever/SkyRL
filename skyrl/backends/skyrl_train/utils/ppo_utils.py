@@ -427,6 +427,7 @@ class AdvantageEstimator(StrEnum):
     GAE = "gae"
     GRPO = "grpo"
     RLOO = "rloo"
+    RLOO_N = "rloo_n"  # RLOO-Neutral: excludes masked samples from baseline
     REINFORCE_PP = "reinforce++"
 
 
@@ -453,6 +454,7 @@ class AdvantageEstimatorRegistry(BaseFunctionRegistry):
             "grpo": [AdvantageEstimator.GRPO, compute_grpo_outcome_advantage],
             "gae": [AdvantageEstimator.GAE, compute_gae_advantage_return],
             "rloo": [AdvantageEstimator.RLOO, compute_rloo_outcome_advantage],
+            "rloo_n": [AdvantageEstimator.RLOO_N, compute_rloo_n_outcome_advantage],
             "reinforce++": [AdvantageEstimator.REINFORCE_PP, compute_reinforce_plus_plus_outcome_advantage],
         }
 
@@ -1155,6 +1157,163 @@ def compute_rloo_outcome_advantage(
     return scores, scores
 
 
+@register_advantage_estimator(AdvantageEstimator.RLOO_N)
+def compute_rloo_n_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    exclude_from_baseline: Optional[np.ndarray] = None,
+    config=None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    RLOO-N (RLOO-Neutral): RLOO variant that excludes masked samples from baseline computation.
+
+    This addresses a key limitation in standard RLOO when handling failed samples:
+    - Infrastructure failures (DaytonaError, NetworkError) should be treated as "neutral" -
+      they don't reflect agent quality and shouldn't affect the baseline.
+    - Agent failures (timeout, context overflow) should be included with zero reward.
+
+    When exclude_from_baseline[i] is True:
+    1. The sample is excluded from the group baseline calculation
+    2. The sample receives advantage=0 (no gradient contribution)
+    3. Other samples in the group have their baselines computed WITHOUT this sample
+
+    This is different from just setting reward=0, which would still pollute the baseline
+    by dragging down the mean for the entire group.
+
+    Args:
+        - token_level_rewards: Float[torch.Tensor, "batch_size seqlen"]
+        - response_mask: Float[torch.Tensor, "batch_size seqlen"]
+        - index: np.ndarray (batch_size) - group IDs for each sample
+        - exclude_from_baseline: Optional[np.ndarray] (batch_size) - bool array, True = exclude
+
+    Returns:
+        - advantages: Float[torch.Tensor, "batch_size seqlen"]
+        - returns: Float[torch.Tensor, "batch_size seqlen"]
+    """
+    from loguru import logger as logger_
+
+    scores = token_level_rewards.sum(dim=-1)
+    bsz = scores.shape[0]
+
+    # Minimum included samples per group for a reliable leave-one-out baseline.
+    # Groups below this threshold get advantage=0 for all samples.
+    min_group_size = 2  # backwards-compatible default
+    filter_zero_reward_groups = True  # skip all-zero-reward groups by default
+    if config is not None:
+        min_group_size = getattr(config, 'rloo_n_min_group_size', 2)
+        filter_zero_reward_groups = getattr(config, 'rloo_n_filter_zero_reward_groups', True)
+
+    # Default: include all samples in baseline
+    if exclude_from_baseline is None:
+        exclude_from_baseline = np.zeros(bsz, dtype=bool)
+
+    # Build per-group score lists, separating included vs excluded
+    id2included_scores = defaultdict(list)  # scores to include in baseline
+    id2included_indices = defaultdict(list)  # indices of included samples
+    id2excluded_indices = defaultdict(list)  # indices of excluded samples
+
+    with torch.no_grad():
+        # First pass: categorize samples
+        for i in range(bsz):
+            group_id = index[i]
+            if exclude_from_baseline[i]:
+                id2excluded_indices[group_id].append(i)
+            else:
+                id2included_scores[group_id].append(scores[i])
+                id2included_indices[group_id].append(i)
+
+        # Detect zero-variance reward groups: when all included samples have
+        # the same reward, RLOO advantage is mathematically zero. Training on
+        # these groups contributes noise that can push the policy toward
+        # entropy collapse. Filter them out.
+        # This handles binary reward (all 0 or all 1), shaped reward where
+        # all samples tie, and any other constant-reward scenario.
+        id2no_variance = {}
+        n_no_variance_groups = 0
+        n_no_variance_samples = 0
+        for group_id in set(index):
+            included = id2included_scores[group_id]
+            if filter_zero_reward_groups and len(included) > 1:
+                stacked = torch.stack(included)
+                has_no_variance = (stacked.max() - stacked.min()).item() == 0.0
+                id2no_variance[group_id] = has_no_variance
+                if has_no_variance:
+                    n_no_variance_groups += 1
+                    n_no_variance_samples += len(included) + len(id2excluded_indices[group_id])
+            else:
+                id2no_variance[group_id] = False
+
+        # Second pass: compute baselines using only included samples
+        id2mean = {}
+        for group_id in set(index):
+            included = id2included_scores[group_id]
+            if id2no_variance.get(group_id, False):
+                # Zero-variance group — skip entirely
+                id2mean[group_id] = torch.tensor(0.0, device=scores.device)
+            elif len(included) < min_group_size:
+                # Below minimum group size — can't compute reliable baseline
+                id2mean[group_id] = torch.tensor(0.0, device=scores.device)
+            else:
+                id2mean[group_id] = torch.mean(torch.stack(included))
+
+        # Third pass: compute advantages
+        for i in range(bsz):
+            group_id = index[i]
+
+            if exclude_from_baseline[i]:
+                # Excluded samples get zero advantage (no gradient contribution)
+                scores[i] = 0.0
+                continue
+
+            if id2no_variance.get(group_id, False):
+                # Zero-variance reward group — zero advantage, no gradient
+                scores[i] = 0.0
+                continue
+
+            # For included samples: use leave-one-out baseline from OTHER included samples
+            included_scores = id2included_scores[group_id]
+            n_included = len(included_scores)
+
+            if n_included < min_group_size:
+                # Below minimum group size — zero advantage for all included samples
+                logger_.warning(
+                    f"RLOO-N: Group {group_id} has {n_included} included sample(s) "
+                    f"(min_group_size={min_group_size}), setting advantage to 0"
+                )
+                scores[i] = 0.0
+            else:
+                # Standard RLOO leave-one-out: baseline = mean of OTHER samples
+                # With correction factor: (n / (n-1)) * (score - group_mean)
+                factor = n_included / (n_included - 1)
+                scores[i] = (scores[i] - id2mean[group_id]) * factor
+
+        # Log summary statistics
+        n_excluded = sum(len(v) for v in id2excluded_indices.values())
+        n_groups_all_excluded = sum(
+            1 for group_id in set(index)
+            if len(id2included_scores[group_id]) == 0
+        )
+        n_groups_below_min = sum(
+            1 for group_id in set(index)
+            if 0 < len(id2included_scores[group_id]) < min_group_size
+        )
+        n_total_groups = len(set(index))
+        if n_excluded > 0 or n_groups_below_min > 0 or n_no_variance_groups > 0:
+            logger_.info(
+                f"RLOO-N: {n_excluded}/{bsz} samples excluded from baseline, "
+                f"{n_groups_all_excluded} groups had all samples excluded, "
+                f"{n_groups_below_min} groups below min_group_size={min_group_size}"
+                + (f", {n_no_variance_groups}/{n_total_groups} groups filtered "
+                   f"(zero reward variance, {n_no_variance_samples} samples)" if n_no_variance_groups > 0 else "")
+            )
+
+        scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
+
+
 @register_advantage_estimator(AdvantageEstimator.GAE)
 def compute_gae_advantage_return(
     token_level_rewards: Float[torch.Tensor, "batch_size seqlen"],
@@ -1254,6 +1413,7 @@ def compute_advantages_and_returns(
     grpo_norm_by_std: bool = True,
     gamma=1.0,
     lambd=1.0,
+    exclude_from_baseline: Optional[np.ndarray] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     estimator_func = AdvantageEstimatorRegistry.get(adv_estimator)
@@ -1267,5 +1427,6 @@ def compute_advantages_and_returns(
         gamma=gamma,
         lambd=lambd,
         config=config,
+        exclude_from_baseline=exclude_from_baseline,
         **kwargs,
     )

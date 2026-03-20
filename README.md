@@ -8,9 +8,9 @@
 
 </div>
 
----
+# Overview of this fork
 
-# Overview
+This is a fork of SkyRL for the [OpenThoughts-Agent project](https://github.com/open-thoughts/OpenThoughts-Agent).
 
 > [!IMPORTANT]
 > **Note:** SkyRL is undergoing a repo reorganization into the [`skyrl/`](./skyrl) folder, which unifies the skyrl libraries below into a single package. The existing packages below are fully functional but will be migrated to new paths shortly. For full [Tinker API](https://docs.skyrl.ai/docs/tinker/overview) support please use the `skyrl/` folder. See the [Tinker Quickstart docs](https://docs.skyrl.ai/docs/tinker/quickstart) to get started. See issue: https://github.com/NovaSky-AI/SkyRL/issues/1145
@@ -19,13 +19,12 @@ SkyRL is a full-stack RL library that provides the following components:
 
 - [skyrl](./skyrl): Our new unified library for RL on your own hardware, with support for the [Tinker API](https://docs.skyrl.ai/docs/tinker/overview). `skyrl` combines our previous work:
 
-  * [`skyrl-train`](./skyrl-train): A modular, performant training framework for RL.  
+  * [`skyrl-train`](./skyrl-train): A modular, performant training framework for RL.
   * [`skyrl-tx`](./skyrl-tx): A cross-platform library implementing a backend for the [Tinker API](https://docs.skyrl.ai/docs/tinker/overview), with a unified engine for training and inference.
 - [`skyrl-agent`](./skyrl-agent): Our agent layer for training long-horizon, real-world agents. For exact reproduction of [SkyRL-v0](https://novasky-ai.notion.site/skyrl-v0) results, please checkout to commit a0d50c482436af7fac8caffa4533616a78431d66.
 - [`skyrl-gym`](./skyrl-gym): Our gymnasium of tool-use tasks, including a library of math, coding, search and SQL environments implemented in the Gymnasium API.
 
-
-# Getting Started
+### Environment
 
 For a guide on developing with SkyRL, take at look at our [Development Guide](https://docs.skyrl.ai/docs/getting-started/development) docs.
 
@@ -66,7 +65,7 @@ For agentic pipelines, check out [`skyrl-agent`](./skyrl-agent) for our work on 
 
 # Acknowledgement
 
-This work is done at [**Berkeley Sky Computing Lab**](https://sky.cs.berkeley.edu/) in collaboration with [**Anyscale**](https://www.anyscale.com/), with generous compute support from [**Anyscale**](https://www.anyscale.com/), [**Databricks**](https://www.databricks.com/), [**NVIDIA**](https://developer.nvidia.com/brev), [**Lambda Labs**](https://lambdalabs.com/service/gpu-cloud?srsltid=AfmBOop5FnmEFTkavVtdZDsLWvHWNg6peXtat-OXJ9MW5GMNsk756PE5), [**AMD**](https://www.amd.com/en), [**AWS**](https://aws.amazon.com/), [**Modal**](https://modal.com/), and [**Daytona**](https://www.daytona.io/).
+This work is done at [**Berkeley Sky Computing Lab**](https://sky.cs.berkeley.edu/) in collaboration with [**Anyscale**](https://www.anyscale.com/), with generous compute support from [**Anyscale**](https://www.anyscale.com/), [**Databricks**](https://www.databricks.com/), [**NVIDIA**](https://developer.nvidia.com/brev), [**Lambda Labs**](https://lambdalabs.com/service/gpu-cloud?srsltid=AfmBOop5FnmEFTkavVtdZDsLWvHWNg6peXtat-OXJ9MW5GMNsk756PE5), [**AMD**](https://www.amd.com/en), [**AWS**](https://aws.amazon.com/), [**Modal**](https://modal.com/), and [**Daytona**](https://www.daytona.io/).
 
 We adopt many lessons and code from several great projects such as [veRL](https://github.com/volcengine/verl), [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF), [Search-R1](https://github.com/PeterGriffinJin/Search-R1), [OpenReasonerZero](https://github.com/Open-Reasoner-Zero/Open-Reasoner-Zero), and [NeMo-RL](https://github.com/NVIDIA-NeMo/RL). We appreciate each of these teams and their contributions to open-source research!
 
@@ -80,22 +79,5 @@ If you find the work in this repository helpful, please consider citing:
   title     = {SkyRL-v0: Train Real-World Long-Horizon Agents via Reinforcement Learning},
   author    = {Shiyi Cao and Sumanth Hegde and Dacheng Li and Tyler Griggs and Shu Liu and Eric Tang and Jiayi Pan and Xingyao Wang and Akshay Malik and Graham Neubig and Kourosh Hakhamaneshi and Richard Liaw and Philipp Moritz and Matei Zaharia and Joseph E. Gonzalez and Ion Stoica},
   year      = {2025},
-}
-```
-
-```bibtex
-@misc{liu2025skyrlsql,
-      title={SkyRL-SQL: Matching GPT-4o and o4-mini on Text2SQL with Multi-Turn RL},
-      author={Shu Liu and Sumanth Hegde and Shiyi Cao and Alan Zhu and Dacheng Li and Tyler Griggs and Eric Tang and Akshay Malik and Kourosh Hakhamaneshi and Richard Liaw and Philipp Moritz and Matei Zaharia and Joseph E. Gonzalez and Ion Stoica},
-      year={2025},
-}
-```
-
-```bibtex
-@misc{griggs2025skrylv01,
-      title={Evolving SkyRL into a Highly-Modular RL Framework},
-      author={Tyler Griggs and Sumanth Hegde and Eric Tang and Shu Liu and Shiyi Cao and Dacheng Li and Charlie Ruan and Philipp Moritz and Kourosh Hakhamaneshi and Richard Liaw and Akshay Malik and Matei Zaharia and Joseph E. Gonzalez and Ion Stoica},
-      year={2025},
-      note={Notion Blog}
 }
 ```

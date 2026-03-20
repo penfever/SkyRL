@@ -68,7 +68,6 @@ from skyrl.train.utils.utils import (
     ray_noset_visible_devices,
 )
 
-_SET_AFFINITY = False
 
 if TYPE_CHECKING:
     from skyrl.backends.skyrl_train.inference_engines.remote_inference_client import (
@@ -87,6 +86,7 @@ class DistributedTorchRayActor:
             level=logging.INFO,
             datefmt="%Y-%m-%d %H:%M:%S",
         )
+
         self._world_size = world_size
         self._rank = rank
         self._local_rank = local_rank
@@ -159,9 +159,24 @@ class DistributedTorchRayActor:
 
     @staticmethod
     def _get_current_node_ip():
+        # Debug: understand where the IP comes from
+        import socket
+        hostname = socket.gethostname()
+
+        # Check if Ray has a global node set
+        global_node = ray._private.worker._global_node
+        global_node_ip = global_node.node_ip_address if global_node else "None (no global node)"
+
+        # What does get_node_ip_address() return?
         address = ray._private.services.get_node_ip_address()
-        # strip ipv6 address
-        return address.strip("[]")
+
+        logging.info(f"[ipv4-debug] hostname={hostname}")
+        logging.info(f"[ipv4-debug] _global_node.node_ip_address={global_node_ip}")
+        logging.info(f"[ipv4-debug] get_node_ip_address()={address}")
+
+        # strip ipv6 address brackets if present
+        result = address.strip("[]")
+        return result
 
     def get_ray_node_id(self):
         return ray.get_runtime_context().get_node_id()
@@ -175,56 +190,19 @@ class DistributedTorchRayActor:
     def get_master_addr_port(self):
         return self._master_addr, self._master_port
 
-    # TODO(tgriggs): For numa affinity, pass in the Worker._local_rank for the second arg here. Distinguish 'rank' and 'local_rank' differ here.
     def _set_numa_affinity(self, rank):
-        def local_rank_to_real_gpu_id(local_rank):
-            cuda_visible_devices = [
-                int(x) for x in os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").split(",")
-            ]
-            return cuda_visible_devices[local_rank]
+        """Set CPU + memory affinity to match the GPU for this rank.
 
-        rank = local_rank_to_real_gpu_id(rank)
-
-        global _SET_AFFINITY
-        if _SET_AFFINITY:
-            return
-
-        from ctypes.util import find_library
-
-        class bitmask_t(Structure):
-            _fields_ = [
-                ("size", c_ulong),
-                ("maskp", POINTER(c_ulong)),
-            ]
-
+        Uses shared NUMA utility that auto-detects GPU-to-CPU NUMA topology
+        via nvidia-smi topo. Handles GH200 unified memory correctly.
+        """
         try:
-            LIBNUMA = CDLL(find_library("numa"))
+            from skyrl_train.utils.numa import set_numa_affinity_for_gpu
+            cuda_devs = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+            gpu_id = int(cuda_devs[rank]) if cuda_devs[0] else rank
+            set_numa_affinity_for_gpu(gpu_id)
         except Exception as e:
-            logger.error(f"Skipping NUMA affinity setup because libnuma is not installed: {e}")
-            _SET_AFFINITY = True
-            return
-
-        LIBNUMA.numa_parse_nodestring.argtypes = [c_char_p]
-        LIBNUMA.numa_parse_nodestring.restype = POINTER(bitmask_t)
-        LIBNUMA.numa_run_on_node_mask.argtypes = [POINTER(bitmask_t)]
-        LIBNUMA.numa_run_on_node_mask.restype = c_int
-        LIBNUMA.numa_set_membind.argtypes = [POINTER(bitmask_t)]
-        LIBNUMA.numa_set_membind.restype = c_void_p
-        LIBNUMA.numa_num_configured_nodes.argtypes = []
-        LIBNUMA.numa_num_configured_nodes.restype = c_int
-
-        def numa_bind(nid: int):
-            bitmask = LIBNUMA.numa_parse_nodestring(bytes(str(nid), "ascii"))
-            LIBNUMA.numa_run_on_node_mask(bitmask)
-            LIBNUMA.numa_set_membind(bitmask)
-
-        numa_nodes = LIBNUMA.numa_num_configured_nodes()
-        if numa_nodes <= 0:
-            numa_nodes = 1
-        num_gpu_pre_numa_node = max(1, 8 // numa_nodes)
-        target_nid = min(numa_nodes - 1, self._local_rank // num_gpu_pre_numa_node)
-        numa_bind(target_nid)
-        _SET_AFFINITY = True
+            logger.debug(f"NUMA affinity setup skipped: {e}")
 
 
 class Worker(DistributedTorchRayActor):
@@ -663,6 +641,18 @@ class PPORayActorGroup:
         # Dispatch the method call
         object_refs = dispatch_class.dispatch(self.actor_infos, method_name, *args, **kwargs)
         return await dispatch_class.async_collect(self.actor_infos, object_refs)
+
+    def kill_actors(self, no_restart: bool = True) -> None:
+        """Kill all Ray actors in this group for proper teardown.
+
+        Args:
+            no_restart: If True, prevents Ray from restarting the actors.
+        """
+        for actor in self._actor_handlers:
+            try:
+                ray.kill(actor, no_restart=no_restart)
+            except Exception:
+                pass  # Actor may already be dead
 
 
 class PolicyWorkerBase(Worker):

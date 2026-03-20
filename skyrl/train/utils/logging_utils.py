@@ -82,3 +82,5 @@ def log_example(
     except Exception as e:
         print(f"Error pretty printing example, debug printing instead: {e}")
         print(f"Example:\n  Input: {prompt}\n  Output (Total Reward: {reward_str}):\n{response}")
+
+

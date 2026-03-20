@@ -38,13 +38,15 @@ trainer:
         # For Megatron, this is used for `lora_A_init_method`, and "xavier", "normal", "kaiming", and "zero" are supported.
         init_method: "kaiming"
     optimizer_config:
+      optimizer: "AdamW" # torch.optim class name (e.g. AdamW, SGD, RMSprop, NAdam, Adafactor, Muon)
       lr: 1.0e-6
-      adam_betas: [0.9, 0.999]
+      adam_betas: [0.9, 0.999] # only used for Adam/AdamW/NAdam/RAdam/Adamax
       weight_decay: 1e-2
       max_grad_norm: 1.0 # gradient clipping
       offload_after_step: true # offload optimizer state to cpu after each full training step. Applicable only when `colocate_all=true`
       num_warmup_steps: 0 # number of mini-batch steps to warmup the optimizer for
-      scheduler: "constant_with_warmup"   
+      scheduler: "constant_with_warmup"
+      optimizer_kwargs: {} # passthrough kwargs for optimizer-specific params (e.g. {momentum: 0.9} for SGD)
     fsdp_config:
       cpu_offload: false # offload params + optimizer state to cpu during fwd pass
       reshard_after_forward: true # fsdp2 only, [True, False, int between 1 and fsdp_size]
@@ -78,13 +80,15 @@ trainer:
         exclude_modules: null
         init_method: "kaiming"
     optimizer_config:
+      optimizer: "AdamW" # torch.optim class name (e.g. AdamW, SGD, RMSprop, NAdam, Adafactor, Muon)
       lr: 5.0e-6
-      adam_betas: [0.9, 0.999]
+      adam_betas: [0.9, 0.999] # only used for Adam/AdamW/NAdam/RAdam/Adamax
       weight_decay: 1e-2
       max_grad_norm: 1.0 # gradient clipping
       offload_after_step: true # offload optimizer state to cpu after each full training step. Applicable only when `colocate_all=true`
       num_warmup_steps: 0 # number of mini-batch steps to warmup the optimizer for
       scheduler: "constant_with_warmup"
+      optimizer_kwargs: {} # passthrough kwargs for optimizer-specific params (e.g. {momentum: 0.9} for SGD)
     fsdp_config:
       cpu_offload: false
       reshard_after_forward: true
@@ -113,6 +117,13 @@ trainer:
     loss_reduction: "token_mean" # "token_mean", "sequence_mean", "seq_mean_token_sum_norm"
     grpo_norm_by_std: true # set to false to disable normalization by std in GRPO
     zero_variance_filter: false # set to true to loss mask out prompts with zero variance rewards. only applicable when rewards are response-level.
+    # RLOO-N: minimum included samples per group for leave-one-out baseline.
+    # Groups below this threshold get advantage=0 for all samples.
+    rloo_n_min_group_size: 4
+    # RLOO-N: skip groups where all included samples have the same reward.
+    # Zero-variance groups produce zero RLOO advantage but can still
+    # contribute noisy gradients that push the policy toward entropy collapse.
+    rloo_n_filter_zero_reward_groups: true
     # GAE parameters
     lambd: 1.0
     gamma: 1.0
@@ -231,6 +242,7 @@ trainer:
   export_path: "${oc.env:HOME}/exports/" # Path for exported artifacts (HF models, debug dumps, etc.)
   bf16: true
   epochs: 1  # Number of passes over the full dataset
+  max_steps: null  # If set, stops training after this many steps (overrides epochs)
   update_epochs_per_batch: 1  # Number of gradient update passes over each train batch
   train_batch_size: 1024  # See `utils/utils.py::validate_batch_sizes` for train, mini, and micro batch size constraints.
   policy_mini_batch_size: 256
@@ -249,8 +261,12 @@ trainer:
   project_name: "skyrl"
   run_name: "test_run"
   logger: "wandb"
+  # Whether to commit/sync to WandB after each training step (useful for async training to see real-time updates)
+  tracker_commit_each_step: false
   dump_data_batch: false
   dump_eval_results: true
+  # SkyRL logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  log_level: "INFO"
 
   # YaRN:
   rope_scaling: null
@@ -264,6 +280,8 @@ trainer:
 generator:
   model_name: ${trainer.policy.model.path}
   model_dtype: "bfloat16" # should match dtype for inference engine
+  # Timeout multiplier for API requests (used by VerifiersGenerator)
+  timeout_multiplier: 1.0
   run_engines_locally: true
   num_inference_engines: 1
   backend: "vllm"
@@ -298,6 +316,9 @@ generator:
   # Enable Ray Prometheus stats logger for vLLM inference engine metrics (vLLM v1 only)
   # When enabled, uses vllm.v1.metrics.ray_wrappers.RayPrometheusStatLogger
   enable_ray_prometheus_stats: false
+  # Log vLLM engine stats (throughput, KV cache, request counts) every N steps.
+  # Stats are logged to console and wandb. Set to 0 to disable.
+  vllm_stats_interval: 1
   gpu_memory_utilization: 0.8
   max_num_seqs: 1024
   remote_inference_engine_urls: ["127.0.0.1:8001"]
@@ -381,6 +402,24 @@ generator:
   rope_theta: ${trainer.rope_theta}
 
   step_wise_trajectories: false
+
+# Teacher model configuration for distillation.
+# When teacher.model_path is set, a separate vLLM inference engine is created for the teacher.
+# The teacher engine is used to score student-generated sequences (on-policy distillation)
+# or generate its own completions (off-policy distillation).
+teacher:
+  model_path: null                          # null = no teacher. Set to HF path or local path.
+  top_k_logprobs: 256                       # K for top-K logprobs from teacher
+  num_inference_engines: 1
+  inference_engine_tensor_parallel_size: 1
+  inference_engine_pipeline_parallel_size: 1
+  gpu_memory_utilization: 0.9
+  enforce_eager: false
+  backend: vllm
+  # Arbitrary vLLM kwargs passed directly to the engine constructor.
+  # Supports quantization, kv_cache_dtype, enable_expert_parallel, max_model_len, etc.
+  # CLI usage: +teacher.engine_init_kwargs.quantization=awq
+  engine_init_kwargs: {}
 
 environment:
   env_class: "gsm8k"

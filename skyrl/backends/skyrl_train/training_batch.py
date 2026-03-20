@@ -371,6 +371,9 @@ class TrainingInput(TypedDict, total=False):
     rewards: Optional[Float[torch.Tensor, "batch_size seq_len"]]
     rollout_logprobs: Optional[Float[torch.Tensor, "batch_size seq_len"]]
     rollout_expert_indices: Optional[Integer[torch.Tensor, "batch_size seq_len layer_num topk"]]
+    # Teacher distillation fields (populated by DistillationTrainer when teacher engine is configured)
+    teacher_top_k_logprobs: Optional[Float[torch.Tensor, "batch_size seq_len K"]]
+    teacher_top_k_indices: Optional[Integer[torch.Tensor, "batch_size seq_len K"]]
 
 
 class TrainingInputBatch(TensorBatch[TrainingInput]):

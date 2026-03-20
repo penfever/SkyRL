@@ -2,6 +2,8 @@ import copy
 import math
 import os
 import shutil
+import asyncio
+import threading
 from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
@@ -76,7 +78,15 @@ from skyrl.train.utils.trainer_utils import (
     validate_generator_output,
     zero_variance_filter,
 )
-from skyrl.train.utils.utils import ResolvedPlacementGroup, configure_ray_worker_logging
+from skyrl.train.utils.utils import ResolvedPlacementGroup, configure_ray_worker_logging, get_system_memory_metrics
+from skyrl.backends.skyrl_train.callbacks import (
+    TrainerCallback,
+    TrainerState,
+    TrainerControl,
+    CallbackHandler,
+    DefaultCallbackHandler,
+    RefModelUpdateCallback,
+)
 
 
 class RayPPOTrainer:
@@ -90,6 +100,7 @@ class RayPPOTrainer:
         generator: GeneratorInterface,
         colocate_pg: Optional[ResolvedPlacementGroup] = None,
         eval_dataset: Optional[PromptDataset] = None,
+        callbacks: Optional[List[TrainerCallback]] = None,
     ):
         self.cfg = cfg
         self.colocate_all = cfg.trainer.placement.colocate_all
@@ -127,6 +138,16 @@ class RayPPOTrainer:
         self.dispatch: WorkerDispatch = None
         configure_ray_worker_logging()
 
+        # Initialize callback system
+        # If callbacks are provided, use them; otherwise create defaults from config
+        if callbacks is not None:
+            self.callback_handler = CallbackHandler(callbacks)
+        else:
+            self.callback_handler = DefaultCallbackHandler(cfg)
+
+        # Trainer control object for callback coordination
+        self._control = TrainerControl()
+
     @property
     def has_critic(self) -> bool:
         """Check if critic model is configured."""
@@ -144,6 +165,32 @@ class RayPPOTrainer:
         if self.train_dataset is not None:
             self.train_dataloader = build_dataloader(self.cfg, self.train_dataset, is_train=True)
             self.total_training_steps = len(self.train_dataloader) * self.cfg.trainer.epochs
+            max_steps = getattr(self.cfg.trainer, 'max_steps', None)
+            if max_steps is not None and max_steps > 0:
+                self.total_training_steps = min(self.total_training_steps, max_steps)
+
+    def _create_trainer_state(self, epoch: int) -> TrainerState:
+        """
+        Create a TrainerState object for the current training state.
+        """
+        num_steps_per_epoch = len(self.train_dataloader)
+        return TrainerState(
+            global_step=self.global_step,
+            epoch=epoch,
+            total_steps=self.total_training_steps,
+            num_steps_per_epoch=num_steps_per_epoch,
+            is_last_step=(self.global_step == self.total_training_steps),
+            is_epoch_end=(self.global_step % num_steps_per_epoch == 0) if num_steps_per_epoch > 0 else False,
+            metrics=dict(self.all_metrics),
+            timings=dict(self.all_timings),
+        )
+
+    def _get_ref_update_callback(self) -> Optional[RefModelUpdateCallback]:
+        """Get the RefModelUpdateCallback if one exists in the callback handler."""
+        for callback in self.callback_handler.callbacks:
+            if isinstance(callback, RefModelUpdateCallback):
+                return callback
+        return None
 
     @torch.no_grad()
     async def eval(self) -> Dict[str, float]:
@@ -174,9 +221,119 @@ class RayPPOTrainer:
             )
         return eval_metrics
 
+    # ------------------------------------------------------------------
+    # Teardown helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _guarded_async(coro, *, timeout: float, label: str) -> None:
+        """Await *coro* with a timeout, logging but never raising on failure."""
+        try:
+            await asyncio.wait_for(coro, timeout=timeout)
+            logger.info(f"{label} complete")
+        except asyncio.TimeoutError:
+            logger.warning(f"{label} timed out after {timeout}s, proceeding with cleanup")
+        except Exception as e:
+            logger.warning(f"{label} error (non-fatal): {e}")
+
+    @staticmethod
+    def _guarded_sync(fn, *, label: str) -> None:
+        """Call *fn()*, logging but never raising on failure."""
+        try:
+            fn()
+            logger.info(f"{label} complete")
+        except Exception as e:
+            logger.warning(f"{label} error (non-fatal): {e}")
+
+    def cleanup_ray_actors(self):
+        """Public alias for :meth:`_kill_ray_actors` (used by entrypoints)."""
+        return self._kill_ray_actors()
+
+    def _kill_ray_actors(self):
+        """Kill all managed Ray actors (models + inference engines)."""
+        for model_name, model in [
+            ("policy_model", self.policy_model),
+            ("critic_model", self.critic_model),
+            ("ref_model", self.ref_model),
+        ]:
+            if model is not None:
+                try:
+                    logger.info(f"Killing {model_name} actors...")
+                    model.kill_actors()
+                except Exception as e:
+                    logger.warning(f"Error killing {model_name} actors: {e}")
+
+        # Kill inference engine actors.
+        if self.inference_engine_client is not None:
+            from skyrl.backends.skyrl_train.inference_engines.ray_wrapped_inference_engine import RayWrappedInferenceEngine
+
+            n_killed = 0
+            for engine in self.inference_engine_client.engines:
+                if isinstance(engine, RayWrappedInferenceEngine):
+                    try:
+                        ray.kill(engine.inference_engine_actor, no_restart=True)
+                        n_killed += 1
+                    except Exception:
+                        pass
+            if n_killed:
+                logger.info(f"Killed {n_killed} inference engine actor(s)")
+
+    async def _teardown(self) -> None:
+        """Best-effort cleanup after training ends (normal or abnormal)."""
+        if self.inference_engine_client is not None:
+            self._guarded_sync(
+                self.inference_engine_client.shutdown_http_endpoint,
+                label="HTTP endpoint shutdown",
+            )
+        await self._guarded_async(
+            self.generator.shutdown(), timeout=60, label="Generator shutdown",
+        )
+        await self._guarded_async(
+            self.inference_engine_client.teardown(), timeout=30, label="Inference engine teardown",
+        )
+        self._guarded_sync(self._kill_ray_actors, label="Ray actor cleanup")
+        self._start_exit_watchdog(timeout=120)
+
+    @staticmethod
+    def _start_exit_watchdog(timeout: int = 120) -> None:
+        """Start a daemon thread that force-exits the process after *timeout* seconds."""
+
+        def _force_exit():
+            logger.error(
+                f"Process still alive {timeout}s after teardown — "
+                "forcing exit to prevent zombie process"
+            )
+            os._exit(1)
+
+        t = threading.Timer(timeout, _force_exit)
+        t.daemon = True
+        t.start()
+
     async def train(self):
         """
         Main training loop for PPO
+        """
+        # Initialize generator resources (e.g., shared QueueOrchestrator for Harbor)
+        # This must happen before any generate() calls
+        try:
+            await self.generator.startup()
+            logger.info("Generator startup complete")
+        except Exception as e:
+            logger.opt(depth=0).error("Generator startup failed: " + str(e))
+            raise
+
+        try:
+            await self._train_loop()
+        finally:
+            await self._teardown()
+
+    async def _train_loop(self):
+        """
+        Internal training loop, separated for proper generator lifecycle management.
+
+        This method uses the callback system to handle periodic actions like
+        checkpointing, evaluation, and logging. Callbacks are invoked at specific
+        points in the training loop to allow extensibility.
         """
         # Initialize weight sync state between policy model and inference engines.
         with Timer("init_weight_sync_state"):
@@ -191,15 +348,26 @@ class RayPPOTrainer:
         with Timer("sync_weights"):
             await self.dispatch.save_weights_for_sampler()
 
-        # Eval before training
-        if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train:
-            with Timer("eval", self.all_timings):
-                eval_metrics = await self.eval()
-                self.tracker.log(eval_metrics, step=self.global_step, commit=True)
-
         # initialize kl controller
         if self.cfg.trainer.algorithm.use_kl_in_reward:
             self.reward_kl_controller = get_kl_controller(self.cfg.trainer.algorithm)
+
+        # Create initial trainer state for on_train_begin callback
+        start_epoch = self.global_step // len(self.train_dataloader)
+        initial_state = self._create_trainer_state(epoch=start_epoch)
+
+        # Call on_train_begin callbacks (handles eval_before_train via EvaluationCallback)
+        self._control.reset()
+        self._control = await self.callback_handler.call_event_async(
+            "on_train_begin", initial_state, self._control, trainer=self
+        )
+
+        # Handle pre-training evaluation if requested by callbacks
+        if self._control.should_evaluate and self.eval_dataset is not None:
+            with Timer("eval", self.all_timings):
+                eval_metrics = await self.eval()
+                self.tracker.log(eval_metrics, step=self.global_step, commit=True)
+            self._control.should_evaluate = False
 
         # main training loop
         pbar = tqdm(total=self.total_training_steps, initial=self.global_step, desc="Training Batches Processed")
@@ -291,66 +459,139 @@ class RayPPOTrainer:
                     with Timer("train_critic_and_policy", self.all_timings):
                         status = self.train_critic_and_policy(training_input)
 
-                    # 8. conditionally save checkpoints and hf model
-                    if self.cfg.trainer.ckpt_interval > 0 and self.global_step % self.cfg.trainer.ckpt_interval == 0:
-                        with Timer("save_checkpoints", self.all_timings):
-                            self.save_checkpoints()
-                    if (
-                        self.cfg.trainer.hf_save_interval > 0
-                        and self.global_step % self.cfg.trainer.hf_save_interval == 0
-                    ):
-                        with Timer("save_hf_model", self.all_timings):
-                            self.save_models()
-
-                    # 9. conditionally sync policy and ref at the end of the epoch
-                    if (
-                        self.cfg.trainer.update_ref_every_epoch
-                        and self.ref_model is not None
-                        and iter == len(self.train_dataloader) - 1
-                        and epoch != self.cfg.trainer.epochs - 1  # skip updating ref at the end of the last epoch
-                    ):
-                        with Timer("update_ref_with_policy", self.all_timings):
-                            self.update_ref_with_policy()
-
-                    # 10. Prepare weights for sampling
+                    # 8. Prepare weights for sampling
                     with Timer("sync_weights", self.all_timings):
                         await self.dispatch.save_weights_for_sampler()
 
-                # 11. set logs
+                # 9. Log status and update metrics
                 logger.info(status)
-                # log epoch info
                 self.all_metrics.update({"trainer/epoch": epoch, "trainer/global_step": self.global_step})
-                if self.cfg.trainer.eval_interval > 0 and (
-                    self.global_step % self.cfg.trainer.eval_interval == 0
-                    or self.global_step == self.total_training_steps
-                ):
+
+                # 7. Create trainer state and call on_step_end callbacks
+                is_epoch_end = (iter == len(self.train_dataloader) - 1)
+                is_last_step = (self.global_step == self.total_training_steps)
+                step_state = TrainerState(
+                    global_step=self.global_step,
+                    epoch=epoch,
+                    total_steps=self.total_training_steps,
+                    num_steps_per_epoch=len(self.train_dataloader),
+                    is_last_step=is_last_step,
+                    is_epoch_end=is_epoch_end,
+                    metrics=dict(self.all_metrics),
+                    timings=dict(self.all_timings),
+                )
+
+                self._control.reset()
+                self._control = await self.callback_handler.call_event_async(
+                    "on_step_end", step_state, self._control, trainer=self
+                )
+
+                # 8. Handle callback control signals
+
+                # Handle checkpoint saving
+                if self._control.should_save:
+                    with Timer("save_checkpoints", self.all_timings):
+                        self.save_checkpoints()
+                    # Call on_save callbacks
+                    await self.callback_handler.call_event_async(
+                        "on_save", step_state, self._control, trainer=self
+                    )
+                    self._control.should_save = False
+
+                # Handle HF model saving
+                if self._control.should_save_hf_model:
+                    with Timer("save_hf_model", self.all_timings):
+                        self.save_models()
+                    self._control.should_save_hf_model = False
+
+                # Handle evaluation
+                if self._control.should_evaluate and self.eval_dataset is not None:
                     with Timer("eval", self.all_timings):
                         eval_metrics = await self.eval()
                         self.all_metrics.update(eval_metrics)
+                    # Call on_evaluate callbacks
+                    await self.callback_handler.call_event_async(
+                        "on_evaluate", step_state, self._control, metrics=eval_metrics, trainer=self
+                    )
+                    self._control.should_evaluate = False
 
-                log_payload = {
-                    **self.all_metrics,
-                    **{f"timing/{k}": v for k, v in self.all_timings.items()},
-                }
-                self.tracker.log(log_payload, step=self.global_step, commit=True)
+                # Handle ref model update at epoch end (via RefModelUpdateCallback)
+                ref_callback = self._get_ref_update_callback()
+                if (
+                    is_epoch_end
+                    and not is_last_step
+                    and self.ref_model is not None
+                    and ref_callback is not None
+                    and ref_callback.should_update_ref
+                ):
+                    with Timer("update_ref_with_policy", self.all_timings):
+                        self.update_ref_with_policy()
+
+                # 9. Log metrics
+                if self._control.should_log:
+                    log_payload = {
+                        **self.all_metrics,
+                        **{f"timing/{k}": v for k, v in self.all_timings.items()},
+                        **get_system_memory_metrics(),
+                    }
+                    self.tracker.log(log_payload, step=self.global_step, commit=True)
+                    # Call on_log callbacks
+                    await self.callback_handler.call_event_async(
+                        "on_log", step_state, self._control, logs=log_payload, trainer=self
+                    )
+
                 self.all_metrics = {}
                 self.all_timings = {}
 
-                # update progress bar after logging
+                # 10. Update progress bar and global step
                 pbar.update(1)
-
                 self.global_step += 1
 
                 del training_input, generator_output
 
+                # 11. Check for max_steps
+                if self.global_step > self.total_training_steps:
+                    logger.info(f"Reached max training steps ({self.total_training_steps})")
+                    break
+
+                # 12. Check for early stopping
+                if self._control.should_training_stop:
+                    logger.info("Training stopped early by callback")
+                    break
+
+            # Call on_epoch_end callbacks
+            epoch_state = self._create_trainer_state(epoch=epoch)
+            self._control.reset()
+            self._control = await self.callback_handler.call_event_async(
+                "on_epoch_end", epoch_state, self._control, trainer=self
+            )
+
+            if self.global_step > self.total_training_steps:
+                break
+
+            if self._control.should_training_stop:
+                logger.info("Training stopped early by callback at epoch end")
+                break
+
+        # End of training
         pbar.close()
         if self.colocate_all:
             await self.inference_engine_client.sleep()
-        if self.cfg.trainer.ckpt_interval > 0:
+            self.policy_model.backload_to_gpu()
+
+        # Call on_train_end callbacks
+        final_state = self._create_trainer_state(epoch=self.cfg.trainer.epochs - 1)
+        self._control.reset()
+        self._control = await self.callback_handler.call_event_async(
+            "on_train_end", final_state, self._control, trainer=self
+        )
+
+        # Handle final checkpoint/model save if requested by callbacks
+        if self._control.should_save:
             with Timer("save_checkpoints", self.all_timings):
                 self.save_checkpoints()
                 logger.info("Saved final checkpoint.")
-        if self.cfg.trainer.hf_save_interval > 0:
+        if self._control.should_save_hf_model:
             with Timer("save_hf_model", self.all_timings):
                 self.save_models()
                 logger.info("Saved final model.")
@@ -659,6 +900,11 @@ class RayPPOTrainer:
             },
         )
         training_input.metadata = {"uids": uids}
+        # For RLOO-N: pass through exclude_from_baseline flags if present
+        if generator_output.get("exclude_from_baseline") is not None:
+            training_input.metadata["exclude_from_baseline"] = np.array(
+                generator_output["exclude_from_baseline"], dtype=bool
+            )
         # padded response length
         training_input.metadata["response_length"] = response_masks_tensor.shape[1]
         batch_num_seq, batch_padded_seq_len = sequences_tensor.shape
@@ -773,8 +1019,12 @@ class RayPPOTrainer:
             "reward/mean_positive_reward": overall_metrics["mean_positive_reward"],
         }
         self.all_metrics.update(reward_metrics)
+        effective_samples = self.all_metrics.get("async/effective_batch_samples", "N/A")
         logger.info(
-            f"reward/avg_pass_at_{n_samples_per_prompt}: {overall_metrics['pass_at_n']}, reward/avg_raw_reward: {overall_metrics['avg_score']}, reward/mean_positive_reward: {overall_metrics['mean_positive_reward']}"
+            f"reward/avg_pass_at_{n_samples_per_prompt}: {overall_metrics['pass_at_n']}, "
+            f"reward/avg_raw_reward: {overall_metrics['avg_score']}, "
+            f"reward/mean_positive_reward: {overall_metrics['mean_positive_reward']} "
+            f"(effective_batch={effective_samples} samples)"
         )
         # re-assign reward but now it's per token rewards
         generator_output["rewards"] = per_token_rewards
@@ -826,6 +1076,8 @@ class RayPPOTrainer:
             advantages = last_step_advantages[traj_ids]
             returns = last_step_returns[traj_ids]
         else:
+            # For RLOO-N: pass exclude_from_baseline if present in metadata
+            exclude_from_baseline = data.metadata.get("exclude_from_baseline", None)
             advantages, returns = ppo_utils.compute_advantages_and_returns(
                 token_level_rewards=token_level_rewards,
                 response_mask=data["response_mask"],
@@ -836,6 +1088,7 @@ class RayPPOTrainer:
                 gamma=self.cfg.trainer.algorithm.gamma,
                 lambd=self.cfg.trainer.algorithm.lambd,
                 grpo_norm_by_std=self.cfg.trainer.algorithm.grpo_norm_by_std,
+                exclude_from_baseline=exclude_from_baseline,
             )
         data["returns"] = returns
         data["advantages"] = advantages
@@ -922,7 +1175,13 @@ class RayPPOTrainer:
             ]
         for key, value in training_input.metadata.items():
             if key not in ["uids", "trajectory_ids"]:
-                new_training_input.metadata[key] = copy.deepcopy(value)
+                # Extend numpy bool arrays so they stay aligned with the padded batch
+                if key == "exclude_from_baseline" and isinstance(value, np.ndarray):
+                    new_training_input.metadata[key] = np.concatenate(
+                        [value, np.ones(pad_size, dtype=value.dtype)]
+                    )
+                else:
+                    new_training_input.metadata[key] = copy.deepcopy(value)
         return new_training_input
 
     @torch.no_grad()
@@ -998,6 +1257,21 @@ class RayPPOTrainer:
                     "policy/rollout_train_logprobs_abs_diff_std": logprobs_diff_std,
                 }
             )
+        # Always log KL divergence as a diagnostic, even when not used as penalty
+        if base_log_probs is not None:
+            _kl = compute_approx_kl(
+                action_log_probs,
+                base_log_probs,
+                loss_mask=training_input["loss_mask"],
+                kl_estimator_type=self.cfg.trainer.algorithm.kl_estimator_type,
+            )
+            _kl_mean = masked_mean(_kl, training_input["loss_mask"], dim=-1).mean().item()
+            _kl_max = torch.max(_kl.abs(), dim=-1)[0].mean().item()
+            self.all_metrics.update({
+                "reward/policy_ref_kl": _kl_mean,
+                "reward/policy_ref_kl_max": _kl_max,
+            })
+
         return training_input
 
     def apply_reward_kl_penalty(

@@ -37,6 +37,7 @@ async def evaluate(
     cfg: SkyRLTrainConfig,
     global_step: int | None,
     tokenizer: AutoTokenizer,
+    val_set_name: str | None = None,
 ) -> Dict[str, float]:
     """Runs generation and evaluation of trajectories.
 
@@ -47,35 +48,54 @@ async def evaluate(
         global_step (int | None): current global step, or
             `None` to indicate a non-training context (e.g., eval-only)
         tokenizer (AutoTokenizer): tokenizer to use
+        val_set_name (str | None): optional name of the validation set being evaluated,
+            used for unique orchestrator naming
 
     Returns:
         Dict[str, float]: evaluation metrics
     """
+    # Start a fresh eval session if the generator supports it
+    # This creates a dedicated QueueOrchestrator for this eval run
+    run_name = getattr(cfg.trainer, "run_name", None) or "eval"
+    eval_step = global_step if global_step is not None else 0
+    has_eval_session = hasattr(generator, "start_eval_session")
 
-    # 1. Get all generator outputs
-    generator_outputs: List[GeneratorOutput] = []
-    concat_all_envs: List[str] = []
-    concat_env_extras: List[Dict[str, Any]] = []
-    concat_uids: List[str] = []
-    sampling_params = cfg.generator.eval_sampling_params
-    pbar = tqdm(total=len(eval_dataloader), initial=0, desc="Evaluation Progress")
-    for _, prompts in enumerate(eval_dataloader):
-        pbar.update(1)
-        generator_input, uids = prepare_generator_input(
-            prompts,
-            cfg.generator.eval_n_samples_per_prompt,
-            get_sampling_params_for_backend(cfg.generator.inference_engine.backend, sampling_params),
-            cfg.environment.env_class,
-            "eval",
-            global_step,
+    if has_eval_session:
+        await generator.start_eval_session(
+            run_name=run_name,
+            eval_step=eval_step,
+            val_set_name=val_set_name,
         )
-        generator_output: GeneratorOutput = await generator.generate(generator_input)
-        validate_generator_output(len(generator_input["prompts"]), generator_output)
-        generator_outputs.append(generator_output)
-        concat_all_envs.extend(generator_input["env_classes"])
-        concat_env_extras.extend(generator_input["env_extras"])
-        concat_uids.extend(uids)
-    concat_generator_outputs: GeneratorOutput = concatenate_generator_outputs(generator_outputs)
+
+    try:
+        # 1. Get all generator outputs
+        generator_outputs: List[GeneratorOutput] = []
+        concat_all_envs: List[str] = []
+        concat_env_extras: List[Dict[str, Any]] = []
+        concat_uids: List[str] = []
+        sampling_params = cfg.generator.eval_sampling_params
+        pbar = tqdm(total=len(eval_dataloader), initial=0, desc="Evaluation Progress")
+        for _, prompts in enumerate(eval_dataloader):
+            pbar.update(1)
+            generator_input, uids = prepare_generator_input(
+                prompts,
+                cfg.generator.eval_n_samples_per_prompt,
+                get_sampling_params_for_backend(cfg.generator.backend, sampling_params),
+                cfg.environment.env_class,
+                "eval",
+                global_step,
+            )
+            generator_output: GeneratorOutput = await generator.generate(generator_input)
+            validate_generator_output(len(generator_input["prompts"]), generator_output)
+            generator_outputs.append(generator_output)
+            concat_all_envs.extend(generator_input["env_classes"])
+            concat_env_extras.extend(generator_input["env_extras"])
+            concat_uids.extend(uids)
+        concat_generator_outputs: GeneratorOutput = concatenate_generator_outputs(generator_outputs)
+    finally:
+        # Always stop the eval session, even if evaluation fails
+        if has_eval_session:
+            await generator.stop_eval_session()
 
     # Extract data_sources from env_extras
     concat_data_sources = [env_extra.get("data_source") for env_extra in concat_env_extras]
@@ -135,6 +155,7 @@ async def evaluate_step_wise(
     cfg: SkyRLTrainConfig,
     global_step: int | None,
     tokenizer: AutoTokenizer,
+    val_set_name: str | None = None,
 ) -> Dict[str, float]:
     """Runs generation and evaluation of trajectories for step-wise training.
 
@@ -147,43 +168,62 @@ async def evaluate_step_wise(
         global_step (int | None): current global step, or
             `None` to indicate a non-training context (e.g., eval-only)
         tokenizer (AutoTokenizer): tokenizer to use
+        val_set_name (str | None): optional name of the validation set being evaluated,
+            used for unique orchestrator naming
 
     Returns:
         Dict[str, float]: evaluation metrics
     """
+    # Start a fresh eval session if the generator supports it
+    # This creates a dedicated QueueOrchestrator for this eval run
+    run_name = getattr(cfg.trainer, "run_name", None) or "eval"
+    eval_step = global_step if global_step is not None else 0
+    has_eval_session = hasattr(generator, "start_eval_session")
 
-    # 1. Get all generator outputs
-    generator_outputs: List[GeneratorOutput] = []
-    concat_all_envs: List[str] = []
-    concat_env_extras: List[Dict[str, Any]] = []
-    concat_uids: List[str] = []
-    sampling_params = cfg.generator.eval_sampling_params
-    pbar = tqdm(total=len(eval_dataloader), initial=0, desc="Evaluation Progress")
-    for _, prompts in enumerate(eval_dataloader):
-        pbar.update(1)
-        generator_input, uids = prepare_generator_input(
-            prompts,
-            cfg.generator.eval_n_samples_per_prompt,
-            get_sampling_params_for_backend(cfg.generator.inference_engine.backend, sampling_params),
-            cfg.environment.env_class,
-            "eval",
-            global_step,
+    if has_eval_session:
+        await generator.start_eval_session(
+            run_name=run_name,
+            eval_step=eval_step,
+            val_set_name=val_set_name,
         )
-        generator_output: GeneratorOutput = await generator.generate(generator_input)
-        traj_id_to_input = {
-            traj_id.instance_id: {"env_class": env_class, "env_extras": env_extra}
-            for traj_id, env_class, env_extra in zip(
-                generator_input["trajectory_ids"], generator_input["env_classes"], generator_input["env_extras"]
+
+    try:
+        # 1. Get all generator outputs
+        generator_outputs: List[GeneratorOutput] = []
+        concat_all_envs: List[str] = []
+        concat_env_extras: List[Dict[str, Any]] = []
+        concat_uids: List[str] = []
+        sampling_params = cfg.generator.eval_sampling_params
+        pbar = tqdm(total=len(eval_dataloader), initial=0, desc="Evaluation Progress")
+        for _, prompts in enumerate(eval_dataloader):
+            pbar.update(1)
+            generator_input, uids = prepare_generator_input(
+                prompts,
+                cfg.generator.eval_n_samples_per_prompt,
+                get_sampling_params_for_backend(cfg.generator.backend, sampling_params),
+                cfg.environment.env_class,
+                "eval",
+                global_step,
             )
-        }
-        for traj_id in generator_output["trajectory_ids"]:
-            assert traj_id.instance_id in traj_id_to_input, f"Trajectory ID {traj_id.instance_id} not found in input"
-            concat_all_envs.append(traj_id_to_input[traj_id.instance_id]["env_class"])
-            concat_env_extras.append(traj_id_to_input[traj_id.instance_id]["env_extras"])
-            concat_uids.append(traj_id.instance_id)
-        validate_generator_output(generator_input, generator_output, step_wise=True)
-        generator_outputs.append(generator_output)
-    concat_generator_outputs: GeneratorOutput = concatenate_generator_outputs(generator_outputs)
+            generator_output: GeneratorOutput = await generator.generate(generator_input)
+            traj_id_to_input = {
+                traj_id.instance_id: {"env_class": env_class, "env_extras": env_extra}
+                for traj_id, env_class, env_extra in zip(
+                    generator_input["trajectory_ids"], generator_input["env_classes"], generator_input["env_extras"]
+                )
+            }
+            for traj_id in generator_output["trajectory_ids"]:
+                assert traj_id.instance_id in traj_id_to_input, f"Trajectory ID {traj_id.instance_id} not found in input"
+                concat_all_envs.append(traj_id_to_input[traj_id.instance_id]["env_class"])
+                concat_env_extras.append(traj_id_to_input[traj_id.instance_id]["env_extras"])
+                concat_uids.append(traj_id.instance_id)
+            validate_generator_output(generator_input, generator_output, step_wise=True)
+            generator_outputs.append(generator_output)
+        concat_generator_outputs: GeneratorOutput = concatenate_generator_outputs(generator_outputs)
+    finally:
+        # Always stop the eval session, even if evaluation fails
+        if has_eval_session:
+            await generator.stop_eval_session()
 
     # Extract data_sources from env_extras
     concat_data_sources = [env_extra.get("data_source") for env_extra in concat_env_extras]

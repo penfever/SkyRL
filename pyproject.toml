@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -8,9 +8,13 @@ include = ["skyrl*"]
 [project]
 name = "skyrl"
 dynamic = ["version"]
-description = "Unified API for training and inference"
+description = "A Post-Training Stack for LLMs"
+authors = [
+    { name = "NovaSkyAI Team"}
+]
+license = "MIT"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "datasets>=4.0.0",
     "pillow>=11.3.0",
