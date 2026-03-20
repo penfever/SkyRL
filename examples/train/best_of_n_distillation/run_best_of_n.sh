@@ -40,7 +40,7 @@ MINI_BATCH_SIZE=512
 EVAL_N_SAMPLES_PER_PROMPT=32
 LR=1e-5
 
-python -m examples.best_of_n_distillation.main_best_of_n \
+python -m examples.train.best_of_n_distillation.main_best_of_n \
   data.train_data="['$TRAIN_FILE']" \
   data.val_data="['$TEST_FILE']" \
   trainer.algorithm.advantage_estimator=$ADVANTAGE_ESTIMATOR \

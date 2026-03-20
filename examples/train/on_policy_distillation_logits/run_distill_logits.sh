@@ -42,7 +42,7 @@ N_SAMPLES_PER_PROMPT=16
 EVAL_N_SAMPLES_PER_PROMPT=32
 LR=1e-5
 
-python -m examples.on_policy_distillation_logits.main_on_policy_distill_logits \
+python -m examples.train.on_policy_distillation_logits.main_on_policy_distill_logits \
   data.train_data="['$TRAIN_FILE']" \
   data.val_data="['$TEST_FILE']" \
   trainer.algorithm.advantage_estimator=$ADVANTAGE_ESTIMATOR \

@@ -5,29 +5,31 @@ Uses a separate vLLM-served teacher model to provide top-K logprobs for
 student-generated sequences. The teacher can be quantized (AWQ/GPTQ) and
 runs on dedicated GPUs, enabling efficient large-teacher → small-student distillation.
 
-Key differences from examples/on_policy_distillation/:
+Key differences from examples/train/on_policy_distillation/:
 - Teacher is a vLLM inference engine (not FSDP RefWorker)
 - Supports quantized teacher models via engine_init_kwargs
 - Provides top-K logprob distributions (not just per-token log_probs)
 - Enables forward KL, reverse KL, and JSD loss variants
 """
 
+import sys
+
 import torch
 import ray
-from omegaconf import DictConfig
-from skyrl_train.entrypoints.main_base import BasePPOExp, config_dir, validate_cfg
-from skyrl_train.entrypoints.main_base import create_teacher_inference_engines_from_config
-from skyrl_train.distillation_trainer import DistillationTrainer
-from skyrl_train.training_batch import TrainingInputBatch
-from skyrl_train.utils import initialize_ray
-from skyrl_train.utils.ppo_utils import (
+
+from skyrl.train.entrypoints.main_base import BasePPOExp
+from skyrl.train.config import SkyRLTrainConfig
+from skyrl.train.utils import validate_cfg
+from skyrl.train.utils.utils import initialize_ray
+from skyrl.backends.skyrl_train.distillation_trainer import DistillationTrainer
+from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.utils.ppo_utils import (
     register_advantage_estimator,
     register_policy_loss,
     reduce_loss,
     masked_mean,
 )
-from skyrl_train.utils.distillation_utils import kl_from_sparse_teacher_logprobs
-import hydra
+from skyrl.backends.skyrl_train.utils.distillation_utils import kl_from_sparse_teacher_logprobs
 
 
 class OnPolicyDistillationLogitsTrainer(DistillationTrainer):
@@ -53,7 +55,6 @@ class OnPolicyDistillationLogitsTrainer(DistillationTrainer):
         action_log_probs = data["action_log_probs"]
 
         # Use per-token reverse KL from teacher log_probs as reward
-        # (same as existing on-policy distillation example)
         rewards = -(action_log_probs - teacher_action_log_probs) * loss_mask
         data["rewards"] = rewards
 
@@ -90,7 +91,11 @@ class OnPolicyDistillationLogitsExp(BasePPOExp):
         trainer = super()._setup_trainer()
 
         # Create teacher engines if configured
-        if self.cfg.teacher.model_path is not None:
+        # NOTE: create_teacher_inference_engines_from_config must be ported to
+        # skyrl.train.entrypoints.main_base from the old skyrl-train tree.
+        if hasattr(self.cfg, "teacher") and self.cfg.teacher.model_path is not None:
+            from skyrl.train.entrypoints.main_base import create_teacher_inference_engines_from_config
+
             teacher_engines, teacher_tokenizer = create_teacher_inference_engines_from_config(
                 self.cfg, self.tokenizer
             )
@@ -104,13 +109,13 @@ class OnPolicyDistillationLogitsExp(BasePPOExp):
 
 
 @ray.remote(num_cpus=1)
-def skyrl_entrypoint(cfg: DictConfig):
+def skyrl_entrypoint(cfg):
     exp = OnPolicyDistillationLogitsExp(cfg)
     exp.run()
 
 
-@hydra.main(config_path=config_dir, config_name="ppo_base_config", version_base=None)
-def main(cfg: DictConfig) -> None:
+def main() -> None:
+    cfg = SkyRLTrainConfig.from_cli_overrides(sys.argv[1:])
     validate_cfg(cfg)
     initialize_ray(cfg)
     ray.get(skyrl_entrypoint.remote(cfg))

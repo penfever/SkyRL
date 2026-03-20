@@ -4,15 +4,15 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Set
 from loguru import logger
 from uuid import uuid4
-from skyrl_train.generators.base import GeneratorInterface, GeneratorInput, GeneratorOutput, TrajectoryID
-from skyrl_train.generators.utils import (
+from skyrl.train.generators.base import GeneratorInterface, GeneratorInput, GeneratorOutput, TrajectoryID
+from skyrl.train.generators.utils import (
     get_rollout_metrics,
     get_response_ids_and_loss_mask_from_messages,
     extract_logprobs_from_rollout_details,
 )
-from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
-from skyrl_train.inference_engines.base import ConversationType
-from skyrl_train.utils.reward_shaping import shape_reward_from_output, shape_reward_with_components
+from skyrl.backends.skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
+from skyrl.backends.skyrl_train.inference_engines.base import ConversationType
+from skyrl.backends.skyrl_train.utils.reward_shaping import shape_reward_from_output, shape_reward_with_components
 from omegaconf import DictConfig
 from pathlib import Path
 
@@ -24,7 +24,7 @@ from harbor.models.trial.result import TrialResult
 from harbor.callbacks import create_rollback_hook
 
 # Schema-driven Harbor config mapping
-from examples.terminal_bench.harbor_config import HarborConfigBuilder
+from .harbor_config import HarborConfigBuilder
 
 # Maximum restart attempts for orchestrator recovery
 MAX_ORCHESTRATOR_RESTART_ATTEMPTS = 3
@@ -1036,7 +1036,7 @@ class TerminalBenchGenerator(GeneratorInterface):
         assistant_logprobs = extract_logprobs_from_rollout_details(rollout_details)
 
         response_ids, loss_mask, rollout_logprobs = get_response_ids_and_loss_mask_from_messages(
-            response_messages, self.tokenizer, assistant_logprobs, custom_chat_template=self.custom_chat_template_content
+            response_messages, self.tokenizer, assistant_logprobs, chat_template=self.custom_chat_template_content
         )
 
         # Determine stop reason

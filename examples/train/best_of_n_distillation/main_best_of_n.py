@@ -15,25 +15,27 @@ Config:
 - teacher.model_path for optional teacher logit scoring.
 """
 
+import sys
+
 import numpy as np
 import torch
 import ray
-from omegaconf import DictConfig
-from skyrl_train.entrypoints.main_base import BasePPOExp, config_dir, validate_cfg
-from skyrl_train.entrypoints.main_base import create_teacher_inference_engines_from_config
-from skyrl_train.distillation_trainer import DistillationTrainer
-from skyrl_train.trainer import RayPPOTrainer
-from skyrl_train.generators.base import GeneratorOutput
-from skyrl_train.training_batch import TrainingInputBatch
-from skyrl_train.utils import initialize_ray
-from skyrl_train.utils.ppo_utils import (
+from typing import List
+
+from skyrl.train.entrypoints.main_base import BasePPOExp
+from skyrl.train.config import SkyRLTrainConfig
+from skyrl.train.utils import validate_cfg
+from skyrl.train.utils.utils import initialize_ray
+from skyrl.backends.skyrl_train.distillation_trainer import DistillationTrainer
+from skyrl.train.trainer import RayPPOTrainer
+from skyrl.train.generators.base import GeneratorOutput
+from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.utils.ppo_utils import (
     register_advantage_estimator,
     register_policy_loss,
     reduce_loss,
 )
-from skyrl_train.utils.distillation_utils import best_of_n_select
-import hydra
-from typing import List
+from skyrl.backends.skyrl_train.utils.distillation_utils import best_of_n_select
 
 
 class BestOfNDistillationTrainer(DistillationTrainer):
@@ -135,7 +137,11 @@ class BestOfNDistillationExp(BasePPOExp):
         """Override to create teacher engines if configured."""
         trainer = super()._setup_trainer()
 
-        if self.cfg.teacher.model_path is not None:
+        if hasattr(self.cfg, "teacher") and self.cfg.teacher.model_path is not None:
+            # NOTE: create_teacher_inference_engines_from_config must be ported to
+            # skyrl.train.entrypoints.main_base from the old skyrl-train tree.
+            from skyrl.train.entrypoints.main_base import create_teacher_inference_engines_from_config
+
             teacher_engines, teacher_tokenizer = create_teacher_inference_engines_from_config(
                 self.cfg, self.tokenizer
             )
@@ -149,13 +155,13 @@ class BestOfNDistillationExp(BasePPOExp):
 
 
 @ray.remote(num_cpus=1)
-def skyrl_entrypoint(cfg: DictConfig):
+def skyrl_entrypoint(cfg):
     exp = BestOfNDistillationExp(cfg)
     exp.run()
 
 
-@hydra.main(config_path=config_dir, config_name="ppo_base_config", version_base=None)
-def main(cfg: DictConfig) -> None:
+def main() -> None:
+    cfg = SkyRLTrainConfig.from_cli_overrides(sys.argv[1:])
     validate_cfg(cfg)
     initialize_ray(cfg)
     ray.get(skyrl_entrypoint.remote(cfg))
