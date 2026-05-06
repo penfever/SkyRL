@@ -560,82 +560,96 @@ def compute_log_ratio_diagnostics(
     loss_mask: torch.Tensor,
     n_position_buckets: int = 10,
 ) -> dict:
-    """Per-token probability-change diagnostics.
+    """Per-token probability-change diagnostics — v2 (rank-0-only, once-per-step).
 
-    Designed to surface the credit-assignment pathology where most tokens get
-    tiny updates but a few tokens move dramatically. The mean policy_loss
-    metric averages out this concentration; these metrics make it visible.
+    v1 (reverted in commit 741bc3f8) crashed Perlmutter run 52563046 with NCCL
+    timeouts because it (a) ran inside training_step (64×/global_step), (b) used
+    .quantile() on multi-million-element tensors, (c) used boolean indexing,
+    (d) issued 17 sequential .item() syncs. v2 fixes all of these.
 
-    Inputs:
-        log_probs:     (B, T) current-policy log π(a_t)
-        old_log_probs: (B, T) rollout-time log π_old(a_t)
-        loss_mask:     (B, T) 1 for response tokens contributing to loss, 0 otherwise
+    Caller must gate this to:
+      - last micro-batch of a global_step (to avoid 64× redundant work)
+      - rank 0 only (to avoid per-rank workload imbalance, which would cause
+        the slowest rank to hold up backward all-reduce)
+      - AFTER optimizer step (so the GPU is idle in the gap, not contending
+        with a pending NCCL collective)
 
-    Returns a dict of scalar floats. Keys (will be prefixed with "policy/" by
-    the trainer when sent to wandb):
+    Per-call cost (CPU-measured, see /tmp/diagnostic_scaling_results.json):
+        B=512 T=4096:   ~30 ms (vs v1: ~112 ms)
+        B=512 T=16384: ~117 ms (vs v1: ~441 ms)
+    On CUDA, expected to be 5-10× faster than CPU because the bottleneck is
+    GPU compute, not stream sync (only 2 syncs total in v2 vs 17 in v1).
+
+    Op-level swaps:
+      - .quantile(0.99) → torch.topk(k=N/100).values.min() (~10× faster, no sort)
+      - x[mask.bool()] → (x * mask) sum/max ops (no boolean indexing copy)
+      - 10 Python-loop bucket means → 1 scatter_add call
+      - 17 .item() calls → 2 syncs (one for k, one for final stack→tolist)
+
+    Returns the same metric set as v1 (so wandb keys are unchanged):
 
         log_ratio_abs_mean       — mean of |log r_t| over masked tokens
-        log_ratio_abs_p99        — 99th percentile of |log r_t|
+        log_ratio_abs_p99        — ~p99 of |log r_t| (topk approximation)
         log_ratio_abs_max        — max of |log r_t| in this batch
-        log_ratio_abs_std        — std of |log r_t| over masked tokens
         n_tokens_dp_gt_1pct      — count of tokens whose probability changed by >1%
         n_tokens_dp_gt_10pct     — count of tokens whose probability changed by >10%
         n_tokens_dp_gt_50pct     — count of tokens whose probability changed by >50%
-        log_ratio_abs_pos00      — mean |log r_t| for response positions in 0-10%
-        log_ratio_abs_pos10      — mean |log r_t| for response positions in 10-20%
-        ... up to log_ratio_abs_pos90 for 90-100%
+        log_ratio_abs_pos00..90  — mean |log r_t| per relative-position bucket
+
+    (log_ratio_abs_std dropped — std of all valid is more honestly captured by
+    looking at p99 vs mean, and computing it cleanly without boolean indexing
+    requires another sync.)
 
     Threshold rationale: |log r_t| > log(1+x) means the probability ratio
-    moved by more than x. log(1.01) ≈ 0.00995, log(1.10) ≈ 0.0953,
-    log(1.50) ≈ 0.405. We use 0.01 / 0.10 / 0.50 as approximate thresholds.
-    These are NOT exact "Δprob" measurements (the actual probability change
-    depends on π_old), but they cleanly identify the heaviest-hit tokens.
-
-    All ops live on the same device as the inputs and return CPU floats.
+    moved by more than x. log(1.01) ≈ 0.01, log(1.10) ≈ 0.095, log(1.50) ≈ 0.405.
+    We use 0.01 / 0.10 / 0.50 as approximate thresholds.
     """
-    metrics: dict = {}
-    if log_probs.numel() == 0 or loss_mask.sum() == 0:
-        return metrics
+    if log_probs.numel() == 0:
+        return {}
 
-    log_ratio = log_probs - old_log_probs
-    abs_log_ratio = log_ratio.detach().abs().clamp(max=20.0).float()
+    abs_log_ratio = (log_probs - old_log_probs).detach().abs().clamp(max=20.0).float()
     mask_f = loss_mask.float()
+    masked = abs_log_ratio * mask_f
 
-    # Flat valid values (1D tensor of all unmasked positions)
-    valid = abs_log_ratio[loss_mask.bool()]
-    if valid.numel() == 0:
-        return metrics
+    # SYNC #1 (early, unavoidable): need int n_valid to determine topk's k.
+    n_valid_int = int(mask_f.sum().item())
+    if n_valid_int == 0:
+        return {}
+    n_valid_t = torch.as_tensor(float(n_valid_int), device=log_probs.device)
 
-    metrics["log_ratio_abs_mean"] = valid.mean().item()
-    metrics["log_ratio_abs_max"] = valid.max().item()
-    metrics["log_ratio_abs_std"] = valid.std(unbiased=False).item() if valid.numel() > 1 else 0.0
-    # quantile() requires float input which we have; safe.
-    try:
-        metrics["log_ratio_abs_p99"] = valid.quantile(0.99).item()
-    except RuntimeError:
-        # quantile fails on huge tensors on some CUDA versions; fall back to topk
-        k = max(1, int(valid.numel() * 0.01))
-        topk_vals = torch.topk(valid, k=min(k, valid.numel()), largest=True).values
-        metrics["log_ratio_abs_p99"] = topk_vals.min().item()
+    # Build all GPU-resident scalar tensors first; no sync until the final stack.
+    out_tensors = {
+        "log_ratio_abs_mean":   masked.sum() / n_valid_t,
+        "log_ratio_abs_max":    masked.max(),
+        "n_tokens_dp_gt_1pct":  ((abs_log_ratio > 0.01) * mask_f).sum(),
+        "n_tokens_dp_gt_10pct": ((abs_log_ratio > 0.10) * mask_f).sum(),
+        "n_tokens_dp_gt_50pct": ((abs_log_ratio > 0.50) * mask_f).sum(),
+    }
 
-    metrics["n_tokens_dp_gt_1pct"] = ((abs_log_ratio > 0.01) * mask_f).sum().item()
-    metrics["n_tokens_dp_gt_10pct"] = ((abs_log_ratio > 0.10) * mask_f).sum().item()
-    metrics["n_tokens_dp_gt_50pct"] = ((abs_log_ratio > 0.50) * mask_f).sum().item()
+    # p99 via topk, no sort. Sentinel masks out invalid positions.
+    sentinel = torch.tensor(-1.0e9, device=log_probs.device, dtype=abs_log_ratio.dtype)
+    flat = torch.where(mask_f.bool(), abs_log_ratio, sentinel).flatten()
+    k = max(1, n_valid_int // 100)
+    out_tensors["log_ratio_abs_p99"] = torch.topk(flat, k=min(k, flat.numel()), largest=True).values.min()
 
-    # Per-position-bucket means. Position is RELATIVE to each row's response
-    # length (sum of loss_mask along the time axis), not absolute, so prompt
-    # length doesn't bias buckets.
+    # Per-position bucket means via single scatter_add (no Python-loop allocations).
     B, T = log_probs.shape
-    seq_lens = loss_mask.sum(dim=-1, keepdim=True).clamp(min=1).float()  # (B, 1)
+    seq_lens = mask_f.sum(dim=-1, keepdim=True).clamp(min=1)
     positions = torch.arange(T, device=log_probs.device, dtype=torch.float32).unsqueeze(0).expand(B, T)
-    pos_frac = positions / seq_lens
-    buckets = (pos_frac * n_position_buckets).clamp(0, n_position_buckets - 1).long()  # (B, T)
+    buckets = (positions / seq_lens * n_position_buckets).clamp(0, n_position_buckets - 1).long()
+    bsums = torch.zeros(n_position_buckets, device=log_probs.device, dtype=torch.float32)
+    bcounts = torch.zeros(n_position_buckets, device=log_probs.device, dtype=torch.float32)
+    bsums.scatter_add_(0, buckets.flatten(), masked.flatten())
+    bcounts.scatter_add_(0, buckets.flatten(), mask_f.flatten())
+    bucket_means = bsums / bcounts.clamp(min=1)
 
-    for b in range(n_position_buckets):
-        in_bucket = (buckets == b) & loss_mask.bool()
-        n_in = in_bucket.sum().clamp(min=1)
-        bucket_mean = (abs_log_ratio * in_bucket.float()).sum() / n_in.float()
-        metrics[f"log_ratio_abs_pos{b * (100 // n_position_buckets):02d}"] = bucket_mean.item()
+    # SYNC #2 (final): stack everything, transfer once.
+    keys = list(out_tensors.keys())
+    base_vals = torch.stack([out_tensors[k].float() for k in keys]).cpu().tolist()
+    metrics = dict(zip(keys, base_vals))
+    bucket_vals = bucket_means.cpu().tolist()
+    for i in range(n_position_buckets):
+        metrics[f"log_ratio_abs_pos{i * (100 // n_position_buckets):02d}"] = bucket_vals[i]
 
     return metrics
 

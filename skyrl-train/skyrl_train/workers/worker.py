@@ -770,18 +770,6 @@ class PolicyWorkerBase(Worker):
                 rollout_logprobs=rollout_action_logprobs,
             )
 
-        # Per-token probability-change diagnostics (visibility into which
-        # tokens carry the gradient signal — see compute_log_ratio_diagnostics
-        # for metric semantics). Computed outside the autocast block so the
-        # math runs in fp32. Cheap (small tensors, simple ops).
-        from skyrl_train.utils.ppo_utils import compute_log_ratio_diagnostics
-
-        ratio_diag = compute_log_ratio_diagnostics(
-            log_probs=action_log_probs,
-            old_log_probs=old_action_log_probs,
-            loss_mask=loss_mask,
-        )
-
         # entropy loss
         with torch.set_grad_enabled(self.cfg.trainer.algorithm.use_entropy_loss):
             # batch_size, seqlen
@@ -812,10 +800,25 @@ class PolicyWorkerBase(Worker):
         self.strategy.backward(loss, self.model, self.optimizer)
 
         grad_norm = None
+        ratio_diag = {}
         if (local_step + 1) % accumulation_steps == 0:
             grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
             if grad_norm is not None:
                 grad_norm = grad_norm.detach().cpu().item()
+
+            # Per-token log-ratio diagnostics — gated to (last micro-batch + rank 0)
+            # so this runs once per global_step on a single rank, AFTER the optimizer
+            # step (when the GPU is idle). See compute_log_ratio_diagnostics docstring
+            # for the full design rationale; v1 of this diagnostic crashed
+            # Perlmutter run 52563046 by running 64×/global_step on every rank,
+            # causing per-rank latency variance that timed out NCCL.
+            if self._rank == 0:
+                from skyrl_train.utils.ppo_utils import compute_log_ratio_diagnostics
+                ratio_diag = compute_log_ratio_diagnostics(
+                    log_probs=action_log_probs,
+                    old_log_probs=old_action_log_probs,
+                    loss_mask=loss_mask,
+                )
 
         if self.record_memory:
             self.save_memory_snapshot(global_step, local_step)
