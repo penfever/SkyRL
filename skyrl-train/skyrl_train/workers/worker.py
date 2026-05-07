@@ -806,19 +806,20 @@ class PolicyWorkerBase(Worker):
             if grad_norm is not None:
                 grad_norm = grad_norm.detach().cpu().item()
 
-            # Per-token log-ratio diagnostics — gated to (last micro-batch + rank 0)
-            # so this runs once per global_step on a single rank, AFTER the optimizer
-            # step (when the GPU is idle). See compute_log_ratio_diagnostics docstring
-            # for the full design rationale; v1 of this diagnostic crashed
-            # Perlmutter run 52563046 by running 64×/global_step on every rank,
-            # causing per-rank latency variance that timed out NCCL.
-            if self._rank == 0:
-                from skyrl_train.utils.ppo_utils import compute_log_ratio_diagnostics
-                ratio_diag = compute_log_ratio_diagnostics(
-                    log_probs=action_log_probs,
-                    old_log_probs=old_action_log_probs,
-                    loss_mask=loss_mask,
-                )
+            # Per-token log-ratio diagnostics — runs on every rank on the last
+            # micro-batch of each global_step, AFTER the optimizer step (when the
+            # GPU is idle). All ranks must compute (and contribute the same keys)
+            # because the downstream `strategy.all_reduce(status)` iterates over
+            # status keys and would deadlock on key-mismatch (this killed v2,
+            # Perlmutter 52593758). v1's failure mode (per-rank latency variance
+            # → NCCL timeout) is already addressed by the op-level swaps inside
+            # compute_log_ratio_diagnostics — see its docstring.
+            from skyrl_train.utils.ppo_utils import compute_log_ratio_diagnostics
+            ratio_diag = compute_log_ratio_diagnostics(
+                log_probs=action_log_probs,
+                old_log_probs=old_action_log_probs,
+                loss_mask=loss_mask,
+            )
 
         if self.record_memory:
             self.save_memory_snapshot(global_step, local_step)

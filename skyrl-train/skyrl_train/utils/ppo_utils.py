@@ -560,17 +560,27 @@ def compute_log_ratio_diagnostics(
     loss_mask: torch.Tensor,
     n_position_buckets: int = 10,
 ) -> dict:
-    """Per-token probability-change diagnostics — v2 (rank-0-only, once-per-step).
+    """Per-token probability-change diagnostics — v3 (all-ranks, once-per-step).
 
-    v1 (reverted in commit 741bc3f8) crashed Perlmutter run 52563046 with NCCL
-    timeouts because it (a) ran inside training_step (64×/global_step), (b) used
-    .quantile() on multi-million-element tensors, (c) used boolean indexing,
-    (d) issued 17 sequential .item() syncs. v2 fixes all of these.
+    v1 (reverted in 741bc3f8) crashed Perlmutter 52563046 with NCCL timeouts:
+    ran inside training_step (64×/global_step), used .quantile() and boolean
+    indexing, issued 17 sequential .item() syncs → per-rank latency variance.
 
-    Caller must gate this to:
+    v2 (fixed v1's latency, but introduced a new bug) gated to rank 0 only so
+    other ranks skipped the call. Their `status` dict was missing the diagnostic
+    keys, and the downstream `strategy.all_reduce(status)` iterates per-key →
+    keys mismatched across ranks → NCCL hang. Killed Perlmutter 52593758 at
+    global_step 1.
+
+    v3: drop the rank-0 gate. Every rank runs the diagnostic on the same shapes
+    (each rank's micro-batch), so all_reduce sees identical keysets. The mean-
+    reduced values are slightly different from rank-0-only (averaged across
+    ranks rather than one rank's view) but more statistically robust. Counts
+    (n_tokens_dp_gt_*) are mean-reduced into per-rank averages — multiply by
+    world_size at read-time for global totals if needed.
+
+    Caller must still gate this to:
       - last micro-batch of a global_step (to avoid 64× redundant work)
-      - rank 0 only (to avoid per-rank workload imbalance, which would cause
-        the slowest rank to hold up backward all-reduce)
       - AFTER optimizer step (so the GPU is idle in the gap, not contending
         with a pending NCCL collective)
 
