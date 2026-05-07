@@ -554,13 +554,28 @@ def _safe_exp_delta(delta: torch.Tensor, clip: float = 20.0, out_dtype=None) -> 
     return y.to(out_dtype or delta.dtype)
 
 
+def _log_ratio_diag_zero_metrics(n_position_buckets: int = 10) -> dict:
+    """The full key set the diagnostic emits, with all values zero.
+
+    Used as a fallback so every rank contributes identical keys to
+    `strategy.all_reduce(status)` even if a rank's input is empty/all-padded
+    or the helper raises. Mismatched keysets across ranks deadlock the per-key
+    NCCL all_reduce (this killed v2 and v3 of the diagnostic).
+    """
+    keys_base = ["log_ratio_abs_mean", "log_ratio_abs_max",
+                 "n_tokens_dp_gt_1pct", "n_tokens_dp_gt_10pct", "n_tokens_dp_gt_50pct",
+                 "log_ratio_abs_p99"]
+    keys_pos = [f"log_ratio_abs_pos{i * (100 // n_position_buckets):02d}" for i in range(n_position_buckets)]
+    return {k: 0.0 for k in keys_base + keys_pos}
+
+
 def compute_log_ratio_diagnostics(
     log_probs: torch.Tensor,
     old_log_probs: torch.Tensor,
     loss_mask: torch.Tensor,
     n_position_buckets: int = 10,
 ) -> dict:
-    """Per-token probability-change diagnostics — v3 (all-ranks, once-per-step).
+    """Per-token probability-change diagnostics — v4 (all-ranks, full key set always).
 
     v1 (reverted in 741bc3f8) crashed Perlmutter 52563046 with NCCL timeouts:
     ran inside training_step (64×/global_step), used .quantile() and boolean
@@ -613,9 +628,17 @@ def compute_log_ratio_diagnostics(
     Threshold rationale: |log r_t| > log(1+x) means the probability ratio
     moved by more than x. log(1.01) ≈ 0.01, log(1.10) ≈ 0.095, log(1.50) ≈ 0.405.
     We use 0.01 / 0.10 / 0.50 as approximate thresholds.
+
+    Always returns the full key set (zeros where input is empty/all-padded), so
+    downstream `strategy.all_reduce(status)` sees identical keys on every rank.
+    Returning a partial/empty dict on some ranks would deadlock the per-key
+    NCCL all_reduce — that bug killed v3 (Perlmutter 52616953, watchdog timeout
+    on a NumelIn=1 ALLREDUCE).
     """
+    zero_metrics = _log_ratio_diag_zero_metrics(n_position_buckets)
+
     if log_probs.numel() == 0:
-        return {}
+        return zero_metrics
 
     abs_log_ratio = (log_probs - old_log_probs).detach().abs().clamp(max=20.0).float()
     mask_f = loss_mask.float()
@@ -624,7 +647,7 @@ def compute_log_ratio_diagnostics(
     # SYNC #1 (early, unavoidable): need int n_valid to determine topk's k.
     n_valid_int = int(mask_f.sum().item())
     if n_valid_int == 0:
-        return {}
+        return zero_metrics
     n_valid_t = torch.as_tensor(float(n_valid_int), device=log_probs.device)
 
     # Build all GPU-resident scalar tensors first; no sync until the final stack.

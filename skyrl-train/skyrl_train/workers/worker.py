@@ -807,19 +807,26 @@ class PolicyWorkerBase(Worker):
                 grad_norm = grad_norm.detach().cpu().item()
 
             # Per-token log-ratio diagnostics — runs on every rank on the last
-            # micro-batch of each global_step, AFTER the optimizer step (when the
-            # GPU is idle). All ranks must compute (and contribute the same keys)
-            # because the downstream `strategy.all_reduce(status)` iterates over
-            # status keys and would deadlock on key-mismatch (this killed v2,
-            # Perlmutter 52593758). v1's failure mode (per-rank latency variance
-            # → NCCL timeout) is already addressed by the op-level swaps inside
-            # compute_log_ratio_diagnostics — see its docstring.
-            from skyrl_train.utils.ppo_utils import compute_log_ratio_diagnostics
-            ratio_diag = compute_log_ratio_diagnostics(
-                log_probs=action_log_probs,
-                old_log_probs=old_action_log_probs,
-                loss_mask=loss_mask,
+            # micro-batch of each global_step, AFTER the optimizer step. The
+            # downstream `strategy.all_reduce(status)` iterates per-key, so all
+            # ranks MUST contribute the same key set or the per-key NCCL all_reduce
+            # deadlocks. v2 violated this with rank-0-only gating (52593758); v3
+            # violated it via early returns inside the helper when n_valid==0
+            # (52616953 — watchdog timeout on a NumelIn=1 ALLREDUCE). v4 wraps
+            # in try/except and falls back to a zeros dict with the full key set.
+            from skyrl_train.utils.ppo_utils import (
+                compute_log_ratio_diagnostics,
+                _log_ratio_diag_zero_metrics,
             )
+            try:
+                ratio_diag = compute_log_ratio_diagnostics(
+                    log_probs=action_log_probs,
+                    old_log_probs=old_action_log_probs,
+                    loss_mask=loss_mask,
+                )
+            except Exception as _e:
+                logger.warning(f"compute_log_ratio_diagnostics failed: {_e!r}; emitting zeros")
+                ratio_diag = _log_ratio_diag_zero_metrics()
 
         if self.record_memory:
             self.save_memory_snapshot(global_step, local_step)
